@@ -4,7 +4,7 @@ setup(
     name="dial-mpc",
     author="Haoru Xue",
     author_email="haoru-xue@berkeley.edu",
-    packages=find_packages(include=["dial_mpc"]),
+    packages=find_packages(include=["dial_mpc*"]),
     version="0.0.2",
     install_requires=[
         "numpy<2.0.0",
@@ -24,6 +24,8 @@ setup(
         "console_scripts": [
             "dial-mpc=dial_mpc.core.dial_core:main",
             "dial-mpc-sim2sim=dial_mpc.core.dial_sim2sim:main",
+            "dial-mpc-sim2sim-eval=dial_mpc.sim2sim.sweep:main",
+            "dial-mpc-sim2sim-report=dial_mpc.sim2sim.analyze:main",
             "dial-mpc-sim2real=dial_mpc.core.dial_sim2real:main",
             "dial-mpc-sim=dial_mpc.deploy.dial_sim:main",
             "dial-mpc-real=dial_mpc.deploy.dial_real:main",

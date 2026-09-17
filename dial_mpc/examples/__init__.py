@@ -2,6 +2,7 @@ examples = [
     "unitree_h1_jog",
     "unitree_h1_push_crate",
     "unitree_h1_loco",
+    "unitree_h1_loco_sim2sim",
     "unitree_go2_trot",
     "unitree_go2_seq_jump",
     "unitree_go2_crate_climb",

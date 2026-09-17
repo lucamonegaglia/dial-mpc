@@ -206,6 +206,152 @@ def fig_sensitivity(rows: List[Dict], out_path: str):
     plt.close(fig)
 
 
+def _spec_groups(theta_cols: List[str]) -> Dict[str, List[str]]:
+    """Group per-element theta columns back under the spec that drew them.
+
+    `sweep.py` flattens a per-element draw into `<name>_<i>` (or `<name>_<i>_<j>`), so
+    `limb_mass_3` and `limb_mass_7` are two elements of one randomization axis. For a
+    summary chart the axis is the unit of interest, not its individual elements.
+    """
+    groups: Dict[str, List[str]] = {}
+    for col in theta_cols:
+        base = col
+        while True:
+            head, sep, tail = base.rpartition("_")
+            if sep and tail.isdigit():
+                base = head
+            else:
+                break
+        groups.setdefault(base, []).append(col)
+    return groups
+
+
+def _group_value(row: Dict, cols: List[str]) -> float:
+    """Scalar summary of one randomization axis for one trial.
+
+    For a single-element axis this is just the value. For a per-element axis it is the
+    mean across elements, which is the physically meaningful aggregate: the mean of 11
+    iid limb-mass scale factors is (proportional to) total limb mass, and the mean of a
+    per-axis CoM offset is its net displacement. Individual-element effects are left to
+    the detailed scatter grid.
+    """
+    vals = [row[c] for c in cols if row.get(c) is not None]
+    return float(np.mean(vals)) if vals else float("nan")
+
+
+def _standardized_effect(x: np.ndarray, y: np.ndarray, n_boot: int = 2000,
+                         seed: int = 0) -> Dict[str, float]:
+    """OLS slope of y on x, expressed per 1 SD of x, with a bootstrap 95% interval.
+
+    Standardizing matters because the axes are not in comparable units: `friction` and
+    `limb_mass` are dimensionless scale factors, `com_offset` is metres, `damping` is
+    log-uniform. A raw slope would make the metre-scale axis look negligible purely
+    because its numbers are small. "Effect per 1 SD of the sampled range" puts every
+    axis on the same footing: how much does the metric move across the spread this
+    sweep actually explored?
+    """
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if len(x) < 8 or np.std(x) == 0:
+        return {"beta": float("nan"), "lo": float("nan"), "hi": float("nan"),
+                "spearman": float("nan"), "n": float(len(x))}
+    sd = float(np.std(x))
+    slope = float(np.polyfit(x, y, 1)[0])
+    rng = np.random.default_rng(seed)
+    boot = np.empty(n_boot)
+    n = len(x)
+    for b in range(n_boot):
+        idx = rng.integers(0, n, n)
+        xb, yb = x[idx], y[idx]
+        boot[b] = np.polyfit(xb, yb, 1)[0] * np.std(xb) if np.std(xb) > 0 else np.nan
+    boot = boot[np.isfinite(boot)]
+    rx = np.argsort(np.argsort(x))
+    ry = np.argsort(np.argsort(y))
+    rho = float(np.corrcoef(rx, ry)[0, 1]) if np.std(rx) > 0 and np.std(ry) > 0 else float("nan")
+    return {
+        "beta": slope * sd,
+        "lo": float(np.percentile(boot, 2.5)) if boot.size else float("nan"),
+        "hi": float(np.percentile(boot, 97.5)) if boot.size else float("nan"),
+        "spearman": rho,
+        "n": float(n),
+    }
+
+
+def fig_sensitivity_summary(rows: List[Dict], out_path: str, csv_path: str):
+    """One bar per randomization axis, ranked by how much it moves the paired delta.
+
+    Two responses side by side because they disagree in an informative way: mean reward
+    is only averaged over the steps a trial survived, so a plant that falls immediately
+    can post a deceptively mild reward delta. Steps-survived captures that directly.
+    """
+    by_trial: Dict[int, Dict[str, Dict]] = {}
+    for r in rows:
+        by_trial.setdefault(int(r["trial"]), {})[cast(str, r["group"])] = r
+    paired = [d for d in by_trial.values() if "randomized" in d and "nominal" in d]
+    if len(paired) < 8:
+        return
+
+    theta_cols = _theta_columns(rows)
+    groups = _spec_groups([c for c in theta_cols
+                           if all(d["randomized"].get(c) is not None for d in paired)])
+    if not groups:
+        return
+
+    d_ret = np.array([d["randomized"]["return_mean"] - d["nominal"]["return_mean"] for d in paired])
+    d_steps = np.array([d["randomized"]["steps_survived"] - d["nominal"]["steps_survived"] for d in paired])
+
+    stats: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for name, cols in groups.items():
+        x = np.array([_group_value(d["randomized"], cols) for d in paired])
+        stats[name] = {
+            "return": _standardized_effect(x, d_ret),
+            "steps": _standardized_effect(x, d_steps),
+        }
+
+    order = sorted(stats, key=lambda k: -abs(stats[k]["return"]["beta"]))
+    ypos = np.arange(len(order))[::-1]
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 0.45 * len(order) + 2.9), dpi=150, sharey=True)
+    fig.patch.set_facecolor(_SURFACE)
+
+    panels = [("return", "Δ mean reward", axes[0]), ("steps", "Δ steps survived", axes[1])]
+    for key, label, ax in panels:
+        betas = np.array([stats[k][key]["beta"] for k in order])
+        los = np.array([stats[k][key]["lo"] for k in order])
+        his = np.array([stats[k][key]["hi"] for k in order])
+        colors = [_RED if b < 0 else _BLUE for b in betas]
+        ax.barh(ypos, betas, height=0.6, color=colors, zorder=3)
+        # A bar whose interval crosses zero is not distinguishable from no effect.
+        for yp, b, lo, hi in zip(ypos, betas, los, his):
+            ax.plot([lo, hi], [yp, yp], color=_INK_SECONDARY, linewidth=1.4, zorder=4,
+                    solid_capstyle="butt")
+        ax.axvline(0.0, color=_BASELINE, linewidth=1.2, zorder=2)
+        _style_axes(ax)
+        ax.set_yticks(ypos)
+        ax.set_yticklabels(order, fontsize=9)
+        ax.set_xlabel(f"{label}   per 1 SD of parameter", fontsize=9)
+
+    fig.suptitle("Which model parameters drive the domain-shift penalty?",
+                 color=_INK, fontsize=12.5, x=0.010, y=0.985, ha="left")
+    fig.text(0.010, 0.945,
+             "Paired randomized − nominal, same MPC seed.  Bars: OLS effect per 1 SD of the "
+             "sampled range.  Lines: bootstrap 95% CI — crossing 0 means no detected effect.",
+             fontsize=8.5, color=_INK_SECONDARY, ha="left", va="top")
+    fig.tight_layout(rect=(0, 0, 1, 0.915))
+    fig.savefig(out_path, facecolor=_SURFACE)
+    plt.close(fig)
+
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["parameter", "response", "effect_per_1sd", "ci_lo", "ci_hi",
+                    "spearman_rho", "n_trials"])
+        for k in order:
+            for key in ("return", "steps"):
+                st = stats[k][key]
+                w.writerow([k, key, f"{st['beta']:.6g}", f"{st['lo']:.6g}",
+                            f"{st['hi']:.6g}", f"{st['spearman']:.4f}", int(st["n"])])
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=str, required=True, help="path to a sim2sim_<timestamp> run directory")
@@ -223,6 +369,11 @@ def main():
     if has_paired:
         fig_paired_delta(rows, os.path.join(fig_dir, "paired_delta_return.png"))
         fig_sensitivity(rows, os.path.join(fig_dir, "sensitivity.png"))
+        fig_sensitivity_summary(
+            rows,
+            os.path.join(fig_dir, "sensitivity_summary.png"),
+            os.path.join(args.run, "sensitivity.csv"),
+        )
     fig_survival(rows, os.path.join(fig_dir, "survival.png"))
 
     rand_rows = [r for r in rows if r["group"] == "randomized"]

@@ -39,10 +39,12 @@ gait: walk
 # per_element: false (default) draws one shared scalar for every selected entry;
 #   true draws one iid value per entry.
 domain_randomization:
-  n_trials: 64
+  n_trials: 256
   seed: 12345
   paired: true          # also run a nominal-plant control trial at the same seed
-  save_rollouts: false  # dump full q/action trajectories per trial under rollouts/
+  save_rollouts: false  # dump EVERY trial's state log; the most divergent trials are
+                        # always saved under interesting/ regardless of this flag
+  n_interesting: 12     # how many divergent trial pairs to save state logs for
   params:
     # +/-20% of torso_link mass (nominal 24.457 kg)
     torso_mass:
@@ -51,11 +53,18 @@ domain_randomization:
       select: [torso_link]
       mode: scale
       range: [0.80, 1.20]
-    # +/-10% on every body's mass, independently
-    body_mass_all:
+    # +/-10% on each LIMB mass, independently. Deliberately excludes torso_link (its
+    # mass is the `torso_mass` axis above -- `select: all` would scale it a second time,
+    # making the two axes multiply and their individual effects unattributable) and
+    # `world`, whose mass is 0 so scaling it is a no-op that shows up as a dead column.
+    limb_mass:
       target: sys
       field: body_mass
-      select: all
+      select: [pelvis,
+               left_hip_yaw_link, left_hip_roll_link, left_hip_pitch_link,
+               left_knee_link, left_ankle_link,
+               right_hip_yaw_link, right_hip_roll_link, right_hip_pitch_link,
+               right_knee_link, right_ankle_link]
       mode: scale
       range: [0.90, 1.10]
       per_element: true

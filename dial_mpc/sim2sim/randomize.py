@@ -85,6 +85,8 @@ class DomainRandConfig:
     seed: int = 12345
     paired: bool = True
     save_rollouts: bool = False
+    # how many of the most divergent paired trials get a full 50 Hz state log written
+    n_interesting: int = 12
     params: Dict[str, Dict[str, Any]] = dc_field(default_factory=dict)
 
 

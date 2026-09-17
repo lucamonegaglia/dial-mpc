@@ -45,6 +45,47 @@ def _flatten_theta(theta: Dict[str, np.ndarray]) -> Dict[str, float]:
     return row
 
 
+def _select_interesting(pairs: List[Dict[str, Any]], n_keep: int) -> List[Dict[str, Any]]:
+    """Pick the trial pairs worth keeping a full state log for.
+
+    Three qualitatively different kinds of divergence, taken together rather than just
+    ranking by |delta return|, because they answer different questions:
+
+      * `survival_flip` -- the randomized plant fell and the nominal one did not (or the
+        reverse). The clearest possible domain-shift failure, and invisible in a mean.
+      * `rand_worse` / `rand_better` -- the extreme tails of paired delta return. The
+        `rand_better` side matters: a perturbed plant that beats nominal means the
+        nominal model is not the easiest plant to control, which is worth seeing.
+      * `steps_gap` -- largest |delta steps survived|, which catches pairs that both
+        eventually fall but at very different times.
+    """
+    tagged: Dict[int, Dict[str, Any]] = {}
+
+    def tag(pair: Dict[str, Any], reason: str):
+        entry = tagged.setdefault(pair["trial"], {"pair": pair, "reasons": []})
+        if reason not in entry["reasons"]:
+            entry["reasons"].append(reason)
+
+    for p in pairs:
+        if bool(p["survived_rand"]) != bool(p["survived_nom"]):
+            tag(p, "survival_flip")
+
+    by_delta = sorted(pairs, key=lambda p: p["delta_return"])
+    per_bucket = max(1, n_keep // 4)
+    for p in by_delta[:per_bucket]:
+        tag(p, "rand_worse")
+    for p in [q for q in reversed(by_delta) if q["delta_return"] > 0][:per_bucket]:
+        tag(p, "rand_better")
+    for p in sorted(pairs, key=lambda q: -abs(q["delta_steps"]))[:per_bucket]:
+        tag(p, "steps_gap")
+
+    def priority(e: Dict[str, Any]) -> tuple:
+        # survival flips first, then by how far apart the two arms ended up
+        return (0 if "survival_flip" in e["reasons"] else 1, -abs(e["pair"]["delta_return"]))
+
+    return [e for e in sorted(tagged.values(), key=priority)][:n_keep]
+
+
 def _trial_row(idx: int, seed: int, result: TrialResult) -> Dict[str, Any]:
     row: Dict[str, Any] = {"trial": idx, "seed": seed}
     row.update(_flatten_theta(result.theta))
@@ -53,6 +94,83 @@ def _trial_row(idx: int, seed: int, result: TrialResult) -> Dict[str, Any]:
     d["survived"] = int(d["survived"])  # CSV-friendly; bool "True"/"False" isn't numeric
     row.update(d)
     return row
+
+
+def _write_interesting(
+    run_dir: str,
+    pairs: List[Dict[str, Any]],
+    logs: Dict[int, Dict[str, Dict[str, np.ndarray]]],
+    n_keep: int,
+    dial_config: DialConfig,
+    csv_path: str,
+) -> None:
+    """Write 50 Hz state logs for the most divergent trial pairs, plus an index that
+    ties each one back to the exact parameters that produced it.
+
+    Every entry is reproducible from the files it names: `config` is the verbatim config
+    the sweep ran (including the seed and the randomization ranges), `trials_csv` holds
+    the full metric row, and `theta` is the realised parameter draw, also duplicated
+    inside each .npz so a trajectory file is self-describing if it gets moved.
+    """
+    selected = _select_interesting(pairs, n_keep)
+    if not selected:
+        return
+    out_dir = os.path.join(run_dir, "interesting")
+    os.makedirs(out_dir, exist_ok=True)
+
+    index: List[Dict[str, Any]] = []
+    for entry in selected:
+        pair = entry["pair"]
+        i = pair["trial"]
+        files = {}
+        for group in ("randomized", "nominal"):
+            log = logs.get(i, {}).get(group)
+            if log is None:
+                continue
+            fname = f"trial_{i:04d}_{group}.npz"
+            np.savez_compressed(
+                os.path.join(out_dir, fname),
+                env_name=np.asarray(dial_config.env_name),
+                trial=np.asarray(i),
+                group=np.asarray(group),
+                seed=np.asarray(pair["seed"]),
+                theta_json=np.asarray(json.dumps(pair["theta"])),
+                **log,
+            )
+            files[group] = fname
+        index.append({
+            "trial": i,
+            "seed": pair["seed"],
+            "reasons": entry["reasons"],
+            "delta_return": pair["delta_return"],
+            "delta_steps": pair["delta_steps"],
+            "randomized": {"return_mean": pair["return_rand"],
+                           "steps_survived": pair["steps_rand"],
+                           "survived": pair["survived_rand"]},
+            "nominal": {"return_mean": pair["return_nom"],
+                        "steps_survived": pair["steps_nom"],
+                        "survived": pair["survived_nom"]},
+            "files": files,
+            "theta": pair["theta"],
+        })
+
+    manifest = {
+        "run_dir": os.path.abspath(run_dir),
+        "config": "../config_used.yaml",
+        "trials_csv": "../" + os.path.basename(csv_path),
+        "env_name": dial_config.env_name,
+        "log_rate_hz": 50.0,
+        "note": (
+            "Each trial's two .npz files are the same MPC seed under the randomized and "
+            "the nominal plant. Reproduce a trial by re-running the sweep with the "
+            "config in `config` (same seed and n_trials) -- trial index and seed are "
+            "recorded per entry; `theta` is the realised parameter draw."
+        ),
+        "entries": index,
+    }
+    with open(os.path.join(out_dir, "index.json"), "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"Saved {len(index)} divergent trial pairs to {out_dir}/ (see index.json)")
 
 
 def main():
@@ -110,6 +228,8 @@ def main():
 
     rng = jax.random.PRNGKey(drc.seed)
     rows: List[Dict[str, Any]] = []
+    pairs: List[Dict[str, Any]] = []
+    logs: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
 
     with tqdm(range(drc.n_trials), desc="Sim2sim trials") as pbar:
         for i in pbar:
@@ -120,12 +240,13 @@ def main():
 
             result = run_trial(
                 dial_config, mbdpi, stepper, diffuse, sys, kp, kd, theta, run_rng,
-                save_rollout=drc.save_rollouts,
             )
             row = _trial_row(i, trial_seed, result)
             row["group"] = "randomized"
             rows.append(row)
 
+            if result.rollout is not None:
+                logs.setdefault(i, {})["randomized"] = result.rollout
             if drc.save_rollouts and result.rollout is not None:
                 np.savez(os.path.join(run_dir, "rollouts", f"trial_{i:04d}_randomized.npz"), **result.rollout)
 
@@ -133,17 +254,32 @@ def main():
                 nominal_result = run_trial(
                     dial_config, mbdpi, stepper, diffuse,
                     stepper.nominal_sys, stepper.nominal_kp, stepper.nominal_kd,
-                    theta, run_rng, save_rollout=drc.save_rollouts,
+                    theta, run_rng,
                 )
                 nrow = _trial_row(i, trial_seed, nominal_result)
                 nrow["group"] = "nominal"
                 rows.append(nrow)
+                if nominal_result.rollout is not None:
+                    logs.setdefault(i, {})["nominal"] = nominal_result.rollout
                 if drc.save_rollouts and nominal_result.rollout is not None:
                     np.savez(
                         os.path.join(run_dir, "rollouts", f"trial_{i:04d}_nominal.npz"),
                         **nominal_result.rollout,
                     )
                 delta = result.return_mean - nominal_result.return_mean
+                pairs.append({
+                    "trial": i,
+                    "seed": trial_seed,
+                    "delta_return": delta,
+                    "delta_steps": result.steps_survived - nominal_result.steps_survived,
+                    "survived_rand": result.survived,
+                    "survived_nom": nominal_result.survived,
+                    "return_rand": result.return_mean,
+                    "return_nom": nominal_result.return_mean,
+                    "steps_rand": result.steps_survived,
+                    "steps_nom": nominal_result.steps_survived,
+                    "theta": {k: np.asarray(v).tolist() for k, v in theta.items()},
+                })
                 pbar.set_postfix({"ret": f"{result.return_mean:.2e}", "d_ret": f"{delta:.2e}"})
             else:
                 pbar.set_postfix({"ret": f"{result.return_mean:.2e}"})
@@ -176,6 +312,9 @@ def main():
         summary["paired_delta_return_std"] = float(np.std(deltas))
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
+
+    if pairs and drc.n_interesting > 0:
+        _write_interesting(run_dir, pairs, logs, drc.n_interesting, dial_config, csv_path)
 
     print(f"\nWrote {len(rows)} trial rows to {csv_path}")
     print(json.dumps(summary, indent=2))

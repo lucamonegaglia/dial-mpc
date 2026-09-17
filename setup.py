@@ -26,6 +26,7 @@ setup(
             "dial-mpc-sim2sim=dial_mpc.core.dial_sim2sim:main",
             "dial-mpc-sim2sim-eval=dial_mpc.sim2sim.sweep:main",
             "dial-mpc-sim2sim-report=dial_mpc.sim2sim.analyze:main",
+            "dial-mpc-sim2sim-view=dial_mpc.sim2sim.view:main",
             "dial-mpc-sim2real=dial_mpc.core.dial_sim2real:main",
             "dial-mpc-sim=dial_mpc.deploy.dial_sim:main",
             "dial-mpc-real=dial_mpc.deploy.dial_real:main",

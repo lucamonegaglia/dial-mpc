@@ -205,6 +205,8 @@ class TrialResult:
     vel_err: float
     yaw_rate_err: float
     torque_rms: float
+    # Per-control-step state log; always populated (it costs ~70 floats/step and the
+    # sweep decides which trials are worth writing to disk).
     rollout: Optional[Dict[str, np.ndarray]] = None
 
 
@@ -239,7 +241,6 @@ def run_trial(
     kd: jax.Array,
     theta: Mapping[str, jax.Array],
     rng: jax.Array,
-    save_rollout: bool = False,
 ) -> TrialResult:
     """Run one closed-loop trial: nominal planner (inside `mbdpi`), plant driven by
     `(sys, kp, kd)`. Mirrors `dial_core.main()`'s loop (apply -> shift -> replan), plus
@@ -275,8 +276,14 @@ def run_trial(
     survived = True
     prev_xbar1: Optional[jax.Array] = None
 
-    rollout_states: List[np.ndarray] = []
-    rollout_actions: List[np.ndarray] = []
+    # Recorded every control step (env.dt = 0.02 s -> 50 Hz for the H1 configs), which
+    # is the rate the MPC actually commands at; there is no sub-step logging because
+    # nothing in the closed loop changes faster than this.
+    log: Dict[str, List[np.ndarray]] = {
+        "qpos": [], "qvel": [], "action": [], "ctrl": [],
+        "reward": [], "done": [], "torso_pos": [], "torso_quat": [],
+        "vel_body": [], "vel_tar": [], "ang_vel_tar": [],
+    }
 
     for t in range(n_steps):
         action = Y0[0]
@@ -294,9 +301,17 @@ def run_trial(
         if prev_xbar1 is not None:
             pred_errs.append(float(jnp.linalg.norm(ps.x.pos - prev_xbar1)))
 
-        if save_rollout:
-            rollout_states.append(np.asarray(ps.q))
-            rollout_actions.append(np.asarray(action))
+        log["qpos"].append(np.asarray(ps.qpos))
+        log["qvel"].append(np.asarray(ps.qvel))
+        log["action"].append(np.asarray(action))
+        log["ctrl"].append(np.asarray(ps.ctrl))
+        log["reward"].append(np.asarray(r, dtype=np.float32))
+        log["done"].append(np.asarray(state.done))
+        log["torso_pos"].append(np.asarray(ps.x.pos[stepper.torso_idx - 1]))
+        log["torso_quat"].append(np.asarray(ps.x.rot[stepper.torso_idx - 1]))
+        log["vel_body"].append(np.asarray(vb))
+        log["vel_tar"].append(np.asarray(state.info["vel_tar"]))
+        log["ang_vel_tar"].append(np.asarray(state.info["ang_vel_tar"]))
 
         done = bool(state.done > 0.5)
         if done:
@@ -317,9 +332,8 @@ def run_trial(
     plan_return_mean = float(np.mean(plan_returns)) if plan_returns else 0.0
     return_mean = return_sum / steps_survived if steps_survived > 0 else 0.0
 
-    rollout = None
-    if save_rollout:
-        rollout = {"q": np.stack(rollout_states), "action": np.stack(rollout_actions)}
+    rollout: Dict[str, np.ndarray] = {k: np.stack(v) for k, v in log.items() if v}
+    rollout["time"] = np.arange(len(log["reward"]), dtype=np.float64) * float(stepper.plant_env.dt)
 
     return TrialResult(
         theta={k: np.asarray(v) for k, v in theta.items()},

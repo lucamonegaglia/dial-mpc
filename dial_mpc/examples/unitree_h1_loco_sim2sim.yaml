@@ -4,7 +4,7 @@
 # is consumed only by `dial-mpc-sim2sim-eval` / `dial_mpc.sim2sim`; `load_dataclass_from_dict`
 # ignores unknown keys, so this file also loads cleanly under plain `dial-mpc`.
 seed: 0
-output_dir: unitree_h1_loco_sim2sim
+output_dir: sim2sim_results/unitree_h1_loco
 n_steps: 400
 
 env_name: unitree_h1_loco

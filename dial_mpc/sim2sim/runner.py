@@ -77,8 +77,6 @@ class PlantStepper:
         self._refresh_joint_range = bool(
             np.array_equal(np.asarray(env.joint_range), np.asarray(env.physical_joint_range))
         )
-        self.reset_jit = jax.jit(env.reset)
-
         @contextlib.contextmanager
         def _swap(sys, kp, kd):
             o_sys = env.sys
@@ -109,7 +107,18 @@ class PlantStepper:
             with self._swap(sys, kp, kd) as e:
                 return e.step(state, action)
 
+        # reset() calls pipeline_init(), which reads self.sys at *trace* time. Jitting
+        # env.reset directly would bake in the nominal model, so every trial's initial
+        # pipeline_state (contacts, derived dynamics quantities) would come from the
+        # planner's model rather than the plant's -- the one place domain shift could
+        # silently leak out of the plant. Route it through the same swap as step, which
+        # also keeps it at a single trace across all parameter draws.
+        def _reset(sys, kp, kd, rng):
+            with self._swap(sys, kp, kd) as e:
+                return e.reset(rng)
+
         self.step_jit = jax.jit(_step)
+        self.reset_jit = jax.jit(_reset)
 
 
 @dataclass
@@ -172,9 +181,23 @@ class TrialResult:
 
 
 def _body_vel(env, pipeline_state):
+    """Body-frame linear and angular velocity of the torso.
+
+    NOTE: this deliberately differs from the envs' own reward code, which writes
+    `xd.ang[...] * jnp.pi / 180.0` (unitree_h1_env.py:272,333,510,792,860 and the go2
+    equivalents). `xd.ang` is already rad/s in brax, so that factor is an upstream
+    unit bug that shrinks the angular term by ~57.3x. Reproducing it here would make
+    `yaw_rate_err` report a number ~57x smaller than the actual rad/s error. The reward
+    is left exactly as the repo wrote it (changing it would change the task); this
+    metric reports true rad/s.
+
+    For the default `unitree_h1_loco` config this is a pure rescaling of the reported
+    metric -- `default_vyaw: 0.0`, so `ang_vel_tar[2]` stays 0 and only the magnitude,
+    not the comparison, was affected.
+    """
     x, xd = pipeline_state.x, pipeline_state.xd
     vb = global_to_body_velocity(xd.vel[env._torso_idx - 1], x.rot[env._torso_idx - 1])
-    ab = global_to_body_velocity(xd.ang[env._torso_idx - 1] * jnp.pi / 180.0, x.rot[env._torso_idx - 1])
+    ab = global_to_body_velocity(xd.ang[env._torso_idx - 1], x.rot[env._torso_idx - 1])
     return vb, ab
 
 
@@ -201,7 +224,7 @@ def run_trial(
     n_steps = dial_config.n_steps
 
     rng, rng_reset = jax.random.split(rng)
-    state = stepper.reset_jit(rng_reset)
+    state = stepper.reset_jit(sys, kp, kd, rng_reset)
     Y0 = jnp.zeros([dial_config.Hnode + 1, mbdpi.nu])
 
     return_sum = 0.0

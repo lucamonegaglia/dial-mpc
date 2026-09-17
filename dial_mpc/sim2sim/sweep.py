@@ -101,7 +101,7 @@ def main():
     print(f"Domain-randomization axes ({len(specs)}): " + ", ".join(s.name for s in specs))
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
-    run_dir = os.path.join(dial_config.output_dir, f"sim2sim_{timestamp}")
+    run_dir = os.path.join(dial_config.output_dir, f"{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
     if drc.save_rollouts:
         os.makedirs(os.path.join(run_dir, "rollouts"), exist_ok=True)

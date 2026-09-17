@@ -12,12 +12,16 @@ safe to call from a jitted function.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Union
+from dataclasses import dataclass
+from dataclasses import field as dc_field
+from typing import Any, Dict, List, Optional, Sequence, Union, cast
 
 import jax
 import jax.numpy as jnp
-import mujoco
+import mujoco  # NOTE: ships no py.typed/.pyi, so every `mujoco.*` access below is
+# unresolvable to a type checker and carries an explicit ignore. This is a gap in the
+# mujoco package itself (it affects dial_mpc's envs identically), not something this
+# module can fix; the ignores are kept narrow so real errors still surface.
 import numpy as np
 
 from brax.base import System
@@ -50,12 +54,12 @@ class ParamSpec:
     scale_inertia: bool = True  # only used when field == "body_mass"
 
     # resolved at `resolve_specs` time
-    indices: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.int64), repr=False)
-    n_draws: int = field(default=1, repr=False)
+    indices: np.ndarray = dc_field(default_factory=lambda: np.array([], dtype=np.int64), repr=False)
+    n_draws: int = dc_field(default=1, repr=False)
     # shape of the selected sub-array (len(indices) [+ trailing dims if `column` is None
     # and the field is >1D, e.g. body_ipos's (n_idx, 3)]). `per_element=True` draws one
     # iid value per scalar in this shape; `per_element=False` draws a single shared scalar.
-    elem_shape: tuple = field(default=(), repr=False)
+    elem_shape: tuple = dc_field(default=(), repr=False)
 
     def __post_init__(self):
         if self.target not in ("sys", "config"):
@@ -81,7 +85,7 @@ class DomainRandConfig:
     seed: int = 12345
     paired: bool = True
     save_rollouts: bool = False
-    params: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    params: Dict[str, Dict[str, Any]] = dc_field(default_factory=dict)
 
 
 def load_domain_rand_config(config_dict: Dict[str, Any]) -> DomainRandConfig:
@@ -93,16 +97,16 @@ def load_domain_rand_config(config_dict: Dict[str, Any]) -> DomainRandConfig:
     return drc
 
 
-def _actuated_dof_mask(mj_model: mujoco.MjModel) -> np.ndarray:
+def _actuated_dof_mask(mj_model: "mujoco.MjModel") -> np.ndarray:  # type: ignore[name-defined]
     """Boolean mask over dofs (length nv) that are actuated joints, i.e. excludes the
     6 free-base dofs (or 0 dofs if the model has no free joint)."""
     mask = np.zeros(mj_model.nv, dtype=bool)
     for j in range(mj_model.njnt):
         jtype = mj_model.jnt_type[j]
         dof_adr = mj_model.jnt_dofadr[j]
-        if jtype == mujoco.mjtJoint.mjJNT_FREE:
+        if jtype == mujoco.mjtJoint.mjJNT_FREE:  # type: ignore[attr-defined]
             continue  # 6 dofs, left unmasked (False)
-        elif jtype == mujoco.mjtJoint.mjJNT_BALL:
+        elif jtype == mujoco.mjtJoint.mjJNT_BALL:  # type: ignore[attr-defined]
             ndof = 3
         else:  # hinge or slide
             ndof = 1
@@ -130,23 +134,23 @@ def _resolve_indices(spec: ParamSpec, sys: System, n_field: int) -> np.ndarray:
     if isinstance(select, (list, tuple)) and len(select) > 0 and isinstance(select[0], str):
         # names -> indices, resolved against the field's natural object type
         if spec.field.startswith("body_"):
-            objtype = mujoco.mjtObj.mjOBJ_BODY
+            objtype = mujoco.mjtObj.mjOBJ_BODY  # type: ignore[attr-defined]
         elif spec.field.startswith("geom_"):
-            objtype = mujoco.mjtObj.mjOBJ_GEOM
+            objtype = mujoco.mjtObj.mjOBJ_GEOM  # type: ignore[attr-defined]
         elif spec.field.startswith("dof_"):
             raise ValueError(
                 f"param '{spec.name}': dof_* fields must use select='all'/'actuated'/int indices, "
                 "not joint names (dof index != joint index for multi-dof joints)."
             )
         elif spec.field.startswith("actuator_"):
-            objtype = mujoco.mjtObj.mjOBJ_ACTUATOR
+            objtype = mujoco.mjtObj.mjOBJ_ACTUATOR  # type: ignore[attr-defined]
         elif spec.field.startswith("jnt_"):
-            objtype = mujoco.mjtObj.mjOBJ_JOINT
+            objtype = mujoco.mjtObj.mjOBJ_JOINT  # type: ignore[attr-defined]
         else:
             raise ValueError(f"param '{spec.name}': cannot resolve names for field '{spec.field}'")
         idx = []
         for nm in select:
-            i = mujoco.mj_name2id(mj, objtype, nm)
+            i = mujoco.mj_name2id(mj, objtype, nm)  # type: ignore[attr-defined]
             if i < 0:
                 raise ValueError(f"param '{spec.name}': name '{nm}' not found for field '{spec.field}'")
             idx.append(i)
@@ -251,7 +255,13 @@ def apply_theta(
         draw = theta[spec.name]
         if spec.target == "sys":
             field_name = spec.field
-            current = sys_updates.get(field_name, getattr(nominal_sys, field_name))
+            nominal_field = sys_updates.get(field_name, getattr(nominal_sys, field_name))
+            if nominal_field is None:
+                raise ValueError(
+                    f"param '{spec.name}': sys.{field_name} is None on this model, "
+                    "so there is nothing to randomize."
+                )
+            current = cast(jax.Array, nominal_field)
             new_field = _apply_one(current, spec.indices, draw, spec.mode, spec.per_element, spec.column)
             sys_updates[field_name] = new_field
             if field_name == "body_mass" and spec.scale_inertia and spec.mode == "scale":
@@ -278,5 +288,7 @@ def apply_theta(
             else:
                 kd = new
 
-    sys = nominal_sys.tree_replace(sys_updates) if sys_updates else nominal_sys
+    # tree_replace is annotated as taking a Mapping of Optional values and returning the
+    # base PyTreeNode; it preserves the concrete type at runtime.
+    sys = cast(System, nominal_sys.tree_replace(dict(sys_updates))) if sys_updates else nominal_sys
     return sys, kp, kd

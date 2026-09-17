@@ -13,7 +13,7 @@ import argparse
 import csv
 import json
 import os
-from typing import Dict, List
+from typing import Dict, List, cast, Sequence, Any
 
 import numpy as np
 
@@ -118,6 +118,7 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
     fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
     fig.patch.set_facecolor(_SURFACE)
     counts, edges, patches = ax.hist(deltas, bins=min(24, max(6, len(deltas) // 3)), zorder=2)
+    patches = cast(Sequence[Any], patches)  # single dataset -> one BarContainer, not a list of them
     for patch, left, right in zip(patches, edges[:-1], edges[1:]):
         center = 0.5 * (left + right)
         patch.set_facecolor(_BLUE if center >= 0 else _RED)
@@ -146,7 +147,7 @@ def fig_survival(rows: List[Dict], out_path: str):
     )
     for b, rate in zip(bars, rates):
         ax.annotate(
-            f"{rate:.0%}", (b.get_x() + b.get_width() / 2, rate),
+            f"{rate:.0%}", (float(b.get_x() + b.get_width() / 2), float(rate)),
             xytext=(0, 4), textcoords="offset points", ha="center",
             fontsize=9, color=_INK,
         )

@@ -46,7 +46,7 @@ def _flatten_theta(theta: Dict[str, np.ndarray]) -> Dict[str, float]:
 
 
 def _trial_row(idx: int, seed: int, result: TrialResult) -> Dict[str, Any]:
-    row = {"trial": idx, "seed": seed}
+    row: Dict[str, Any] = {"trial": idx, "seed": seed}
     row.update(_flatten_theta(result.theta))
     d = asdict(result)
     del d["theta"], d["rollout"]

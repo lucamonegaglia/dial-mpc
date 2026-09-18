@@ -13,6 +13,7 @@ import argparse
 import csv
 import json
 import os
+import subprocess
 import time
 from dataclasses import asdict
 from typing import Any, Dict, List, cast
@@ -145,6 +146,36 @@ def _select_interesting(
                 progressed = True
 
     return list(selected.values())
+
+
+DIFF_FILENAME = "git_diff.patch"
+
+
+def _git_provenance(run_dir: str) -> Dict[str, Any]:
+    """Commit for the code that produced a run, so any result traces back to exact source.
+    Any working-tree diff is written to `<run_dir>/git_diff.patch` and only referenced from
+    the returned dict, which keeps it out of config_used.yaml."""
+    def run(*cmd: str) -> str:
+        try:
+            return subprocess.run(cmd, cwd=os.path.dirname(os.path.abspath(__file__)),
+                                  capture_output=True, text=True, timeout=30,
+                                  check=True).stdout.strip()
+        except Exception as exc:
+            return f"<unavailable: {exc}>"
+
+    diff = run("git", "diff", "HEAD")
+    if diff:
+        with open(os.path.join(run_dir, DIFF_FILENAME), "w") as f:
+            f.write(diff + "\n")
+    return {
+        "commit": run("git", "rev-parse", "HEAD"),
+        "branch": run("git", "rev-parse", "--abbrev-ref", "HEAD"),
+        "dirty": bool(diff),
+        # Untracked files are invisible to `git diff`, so name them explicitly.
+        "untracked": [f for f in run("git", "ls-files", "--others",
+                                     "--exclude-standard").split("\n") if f],
+        "diff": DIFF_FILENAME if diff else None,
+    }
 
 
 def _cache_size(fn: Any) -> int:
@@ -330,8 +361,9 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     if drc.save_rollouts:
         os.makedirs(os.path.join(run_dir, "rollouts"), exist_ok=True)
+    config_dict = dict(config_dict, git=_git_provenance(run_dir))
     with open(os.path.join(run_dir, "config_used.yaml"), "w") as f:
-        yaml.safe_dump(config_dict, f)
+        yaml.safe_dump(config_dict, f, default_flow_style=False)
 
     rng = jax.random.PRNGKey(drc.seed)
     rows: List[Dict[str, Any]] = []

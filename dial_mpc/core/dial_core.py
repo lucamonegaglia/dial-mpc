@@ -24,6 +24,7 @@ import dial_mpc.envs as dial_envs
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 from dial_mpc.examples import examples
 from dial_mpc.core.dial_config import DialConfig
+from typing import cast
 
 plt.style.use("science")
 
@@ -161,29 +162,33 @@ class MBDPI:
                     "reverse_once(..., model=...) requires MBDPI(..., model_step_fn=...)"
                 )
             rewss, pipeline_statess = self.rollout_us_model_vmap(model, state, us)
-        rew_Ybar_i = rewss[-1].mean()
         qss = pipeline_statess.q
         qdss = pipeline_statess.qd
         xss = pipeline_statess.x.pos
         rews = rewss.mean(axis=-1)
 
-        # Reject samples whose imagined rollout diverged, instead of letting them poison
-        # the whole update. A single non-finite entry among the Nsample+1 rollouts makes
-        # `rews.std()` NaN, hence every `logp0` NaN, hence `softmax` all-NaN, hence a NaN
-        # control -- so one bad sample silently destroys the step and every step after it.
-        # Divergence is reachable whenever the model is stiff for this integration step
-        # (the H1 configs run a 20 ms step), which randomized parameters make far more
-        # likely than the hand-tuned nominal ones.
+        # Reject diverged samples before they poison the update. Two distinct failures:
+        # a non-finite reward makes `rews.std()` NaN
+        # a huge-but-*finite* one inflates std to ~1e16, flattens every logp0 to 0 and makes softmax
+        # uniform (ESS == Nsample).        
+        # So: mask non-finite, and estimate the scale on a trimmed core so outliers cannot
+        # move it. Trimming affects the scale only, never the ranking.
         finite = jnp.isfinite(rews)
-        n_finite = jnp.maximum(finite.sum(), 1)
-        mean_finite = jnp.where(finite, rews, 0.0).sum() / n_finite
-        rews_safe = jnp.where(finite, rews, mean_finite)
-        # The Ybar_i sample (appended last) can diverge too, which would bias every logp0.
-        rew_Ybar_i = jnp.where(jnp.isfinite(rew_Ybar_i), rew_Ybar_i, mean_finite)
-        std = rews_safe.std(axis=-1)
+        TRIM = 0.02
+        rews_hi = cast(jnp.ndarray, jnp.where(finite, rews, jnp.inf))  # non-finite sort out of both quantiles
+        inlier = finite & (rews >= jnp.quantile(rews_hi, TRIM)) & (
+            rews <= jnp.quantile(rews_hi, 1.0 - TRIM)
+        )
+        n_in = jnp.maximum(inlier.sum(), 1)
+        mu = jnp.where(inlier, rews, 0.0).sum() / n_in
+        dev = jnp.where(inlier, rews - mu, 0.0)  # mask before squaring: -6e32 overflows f32
+        std = jnp.sqrt((dev * dev).sum() / n_in)
         std = jnp.where(std > 0.0, std, 1.0)  # also guards the all-equal-rewards case
 
-        logp0 = (rews_safe - rew_Ybar_i) / std / self.args.temp_sample
+        rews_safe = jnp.where(finite, rews, mu)
+        # Centring on `mu` instead of the incumbent's own reward is a no-op (softmax is
+        # shift-invariant) but keeps logits near zero when the incumbent is what blew up.
+        logp0 = (rews_safe - mu) / std / self.args.temp_sample
         logp0 = jnp.where(finite, logp0, -jnp.inf)  # diverged samples get zero weight
         logp0 = jnp.where(finite.any(), logp0, 0.0)  # all diverged -> uniform, not all-NaN
 
@@ -213,6 +218,10 @@ class MBDPI:
             # sample cloud, so one near-diverging-but-finite sample dominates it.
             "rew_plan": jnp.dot(weights, rews_safe),
             "frac_diverged": 1.0 - finite.mean(),
+            "frac_trimmed": 1.0 - inlier.mean(),  # excluded from the scale estimate only
+            "plan_std": std,
+            # ESS ~= 1 is greedy; ESS ~= Nsample means the update was uniform, i.e. degenerate.
+            "ess": 1.0 / jnp.sum(weights ** 2),
             "qbar": qbar,
             "qdbar": qdbar,
             "xbar": xbar,

@@ -1,4 +1,4 @@
-"""dial-mpc-sim2sim-reproduce: replay one specific historical sim2sim trial.
+"""dial-mpc-sim2sim-reproduce: replay specific historical sim2sim trials.
 
 `dial-mpc-sim2sim-eval` only writes full 50 Hz state logs for the (small) subset of
 trials `_select_interesting` picked; every other trial's exact rollout is gone once the
@@ -12,10 +12,15 @@ directory shape `sweep._write_interesting` uses under `interesting/`, so a repro
 can never overwrite, or be mistaken for, the sweep's own selection, and
 `view.generate_trial_outputs` can turn either one into a compare.png / html the same way.
 
+`--trial` takes one or more indices; the env build and JIT compilation (the expensive
+part) happen once and are reused across all of them, since they depend only on
+`config_used.yaml`, not on any particular trial's theta/seed.
+
 Usage:
     dial-mpc-sim2sim-reproduce --run <run_dir> --trial 168
     dial-mpc-sim2sim-reproduce --run <run_dir> --trial 168 --html
     dial-mpc-sim2sim-reproduce --run <run_dir> --trial 168 --html --force
+    dial-mpc-sim2sim-reproduce --run <run_dir> --trial 168 248 118 204
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ import argparse
 import csv
 import json
 import os
+from dataclasses import dataclass
 from typing import Dict, List
 
 import jax
@@ -95,21 +101,22 @@ def _already_present(trial_dir: str) -> bool:
     )
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--run", type=str, required=True, help="a sim2sim run directory")
-    parser.add_argument("--trial", type=int, required=True, help="trial index to reproduce")
-    parser.add_argument("--html", action="store_true", help="also write brax 3D playbacks")
-    parser.add_argument("--force", action="store_true", help="regenerate even if already saved")
-    args = parser.parse_args()
+@dataclass
+class ReproContext:
+    """Everything a reproduction needs that depends only on `config_used.yaml`, not on
+    any particular trial -- built once and reused across a `--trial` batch."""
 
-    trial_dir = os.path.join(args.run, "reproduced", f"trial_{args.trial:04d}")
-    if not args.force and _already_present(trial_dir):
-        print(f"Trial {args.trial} is already reproduced in {trial_dir}/ (pass --force to "
-              f"redo it). Inspect with:\n  dial-mpc-sim2sim-view --traj-dir {trial_dir}")
-        return
+    run_dir: str
+    dial_config: DialConfig
+    mbdpi: MBDPI
+    stepper: PlantStepper
+    diffuse: DiffuseStepper
+    planner: PlannerStepper
+    specs: List[ParamSpec]
 
-    config_path = os.path.join(args.run, "config_used.yaml")
+
+def build_context(run_dir: str) -> ReproContext:
+    config_path = os.path.join(run_dir, "config_used.yaml")
     if not os.path.exists(config_path):
         raise SystemExit(f"Need {config_path} to rebuild the env this run used.")
     config_dict = yaml.safe_load(open(config_path))
@@ -130,25 +137,40 @@ def main():
     if drc.terminate_on_physical_limits:
         planner_env.terminate_on_physical_limits = True
         plant_env.terminate_on_physical_limits = True
+        print("Termination: physical joint limits (not the narrower action-scaling band)")
+    else:
+        print("Termination: env default (the hand-tuned action-scaling band)")
 
-    seed, theta_np = _load_seed_and_theta(args.run, args.trial, specs)
+    return ReproContext(run_dir, dial_config, mbdpi, stepper, diffuse, planner, specs)
+
+
+def reproduce_trial(ctx: ReproContext, trial: int, html: bool = False, force: bool = False):
+    trial_dir = os.path.join(ctx.run_dir, "reproduced", f"trial_{trial:04d}")
+    if not force and _already_present(trial_dir):
+        print(f"Trial {trial} is already reproduced in {trial_dir}/ (pass --force to "
+              f"redo it). Inspect with:\n  dial-mpc-sim2sim-view --traj-dir {trial_dir}")
+        return None
+
+    seed, theta_np = _load_seed_and_theta(ctx.run_dir, trial, ctx.specs)
     theta = {k: jnp.asarray(v) for k, v in theta_np.items()}
     theta_rounded = {k: np.asarray(v).round(4).tolist() for k, v in theta_np.items()}
-    print(f"Trial {args.trial}: seed={seed}")
+    print(f"Trial {trial}: seed={seed}")
     print(f"theta: {theta_rounded}")
 
-    sys, kp, kd = apply_theta(nominal.sys, nominal.kp, nominal.kd, theta, specs)
+    nominal = ctx.stepper.nominal
+    sys, kp, kd = apply_theta(nominal.sys, nominal.kp, nominal.kd, theta, ctx.specs)
     plant_model = Model(sys, kp, kd)
     run_rng = jax.random.PRNGKey(seed)
 
     print("Running nominal_planner arm (planner believes nominal parameters)...")
     result_nom = run_trial(
-        dial_config, mbdpi, stepper, diffuse, plant_model, planner.nominal, theta, run_rng
+        ctx.dial_config, ctx.mbdpi, ctx.stepper, ctx.diffuse, plant_model,
+        ctx.planner.nominal, theta, run_rng,
     )
     print("Running true_planner arm (planner told the true parameters)...")
     result_true = run_trial(
-        dial_config, mbdpi, stepper, diffuse, plant_model,
-        planner.model_from(sys, kp, kd), theta, run_rng,
+        ctx.dial_config, ctx.mbdpi, ctx.stepper, ctx.diffuse, plant_model,
+        ctx.planner.model_from(sys, kp, kd), theta, run_rng,
     )
     results = {GROUP_NOMINAL_PLANNER: result_nom, GROUP_TRUE_PLANNER: result_true}
 
@@ -163,8 +185,8 @@ def main():
         path = os.path.join(trial_dir, f"{group}.npz")
         np.savez_compressed(
             path,
-            env_name=np.asarray(dial_config.env_name),
-            trial=np.asarray(args.trial),
+            env_name=np.asarray(ctx.dial_config.env_name),
+            trial=np.asarray(trial),
             group=np.asarray(group),
             seed=np.asarray(seed),
             theta_json=np.asarray(theta_json),
@@ -174,8 +196,23 @@ def main():
 
     delta_return = result_nom.return_mean - result_true.return_mean
     delta_steps = result_nom.steps_survived - result_true.steps_survived
-    title = f"Trial {args.trial} (reproduced) — Δreturn {delta_return:+.4f}, Δsteps {delta_steps:+d}"
-    generate_trial_outputs(os.path.abspath(args.run), trial_dir, title, html=args.html)
+    title = f"Trial {trial} (reproduced) — Δreturn {delta_return:+.4f}, Δsteps {delta_steps:+d}"
+    generate_trial_outputs(os.path.abspath(ctx.run_dir), trial_dir, title, html=html)
+    return seed, results
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run", type=str, required=True, help="a sim2sim run directory")
+    parser.add_argument("--trial", type=int, required=True, nargs="+",
+                         help="one or more trial indices to reproduce")
+    parser.add_argument("--html", action="store_true", help="also write brax 3D playbacks")
+    parser.add_argument("--force", action="store_true", help="regenerate even if already saved")
+    args = parser.parse_args()
+
+    ctx = build_context(args.run)
+    for trial in args.trial:
+        reproduce_trial(ctx, trial, html=args.html, force=args.force)
 
 
 if __name__ == "__main__":

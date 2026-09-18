@@ -132,15 +132,14 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
         patch.set_edgecolor(_SURFACE)
         patch.set_linewidth(1.0)
     ax.axvline(0.0, color=_INK_MUTED, linewidth=1.2, linestyle=(0, (3, 2)), zorder=3)
-    # Per-step return divides by steps_survived, so pairs that fall at very different
-    # step counts land far out in the tail (see METRICS.md, "Censoring bias"). A linear
-    # y-axis makes the near-zero bulk unreadable once that tail exists; log-scale keeps
-    # both visible without changing the bins or hiding the outliers.
+    # A handful of trials sit far out in either tail; a linear y-axis makes the near-zero
+    # bulk unreadable once they're in frame, so log-scale keeps both visible without
+    # changing the bins or hiding the outliers.
     ax.set_yscale("symlog", linthresh=1)
     _style_axes(ax)
     ax.set_xlabel("\n".join(textwrap.wrap(
-        "Δ mean reward (nominal-parameter − true-parameter planner, same plant & seed). "
-        "Confounded by unequal survival time -- see METRICS.md.", width=60)))
+        "Δ mean reward (nominal-parameter − true-parameter planner, same plant & seed).",
+        width=60)))
     ax.set_ylabel("Trial count (log)")
     ax.set_title("Cost of planning with the wrong model", color=_INK, fontsize=11, loc="left")
     fig.tight_layout()
@@ -213,8 +212,7 @@ def fig_sensitivity(rows: List[Dict], theta_cols: List[str], out_path: str):
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
 
-    fig.suptitle("Per-parameter sensitivity of planner model error "
-                 "(x-axis of each panel is the confounded return delta -- see METRICS.md)",
+    fig.suptitle("Per-parameter sensitivity of planner model error",
                  color=_INK, fontsize=11, x=0.02, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 1 - 0.5 / (3.2 * nrows + 0.5)))
     fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")
@@ -348,8 +346,8 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_path: s
 
     subtitle = textwrap.fill(
         "Same plant and MPC seed in both arms; only the planner's model differs. Bars: OLS effect "
-        "per 1 SD of the sampled range (left panel is the censoring-confounded return delta -- see "
-        "METRICS.md). Lines: bootstrap 95% CI -- crossing 0 means no detected effect.",
+        "per 1 SD of the sampled range. Lines: bootstrap 95% CI -- crossing 0 means no detected "
+        "effect.",
         width=118)
     n_subtitle_lines = subtitle.count("\n") + 1
     fig.suptitle("Which model errors hurt the planner most?",

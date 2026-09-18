@@ -376,7 +376,7 @@ def main():
     os.makedirs(fig_dir, exist_ok=True)
 
     fig_return_ecdf(rows, os.path.join(fig_dir, "return_ecdf.png"))
-    has_paired = any(r["group"] == "nominal" for r in rows)
+    has_paired = any(r["group"] == GROUP_TRUE_PLANNER for r in rows)
     if has_paired:
         fig_paired_delta(rows, os.path.join(fig_dir, "paired_delta_return.png"))
         fig_sensitivity(rows, os.path.join(fig_dir, "sensitivity.png"))

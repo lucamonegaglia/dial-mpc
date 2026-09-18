@@ -13,7 +13,8 @@ import argparse
 import csv
 import json
 import os
-from typing import Dict, List, cast, Sequence, Any
+import textwrap
+from typing import Any, Dict, List, Optional, Sequence, cast
 
 import numpy as np
 
@@ -24,7 +25,6 @@ import matplotlib.pyplot as plt
 
 from dial_mpc.sim2sim.groups import (
     DISPLAY, GROUPS, GROUP_NOMINAL_PLANNER, GROUP_TRUE_PLANNER,
-    LEGACY_GROUPS, LEGACY_WARNING,
 )
 
 # Validated default palette (dial_mpc.sim2sim.analyze does not touch brand color --
@@ -58,41 +58,32 @@ def _style_axes(ax):
 def load_trials(run_dir: str) -> List[Dict]:
     path = os.path.join(run_dir, "trials.csv")
     rows = []
-    legacy = [False]
     with open(path, newline="") as f:
-        reader = csv.DictReader(f)
-        for r in reader:
+        for r in csv.DictReader(f):
             parsed = {}
             for k, v in r.items():
                 if v == "" or v is None:
                     parsed[k] = None
-                    continue
-                if k in ("group",):
-                    parsed[k] = LEGACY_GROUPS.get(v, v)
-                    if v in LEGACY_GROUPS:
-                        legacy[0] = True
+                elif k == "group":
+                    parsed[k] = v
                 else:
                     try:
                         parsed[k] = float(v)
                     except ValueError:
                         parsed[k] = v
             rows.append(parsed)
-    if legacy[0]:
-        print("WARNING: " + LEGACY_WARNING + "\n")
     return rows
 
 
-def _theta_columns(rows: List[Dict]) -> List[str]:
-    known = {
-        "trial", "group", "seed", "return_sum", "return_mean", "steps_survived",
-        "survived", "plan_return_mean", "optimism_gap", "pred_err_1step",
-        "vel_err", "yaw_rate_err", "torque_rms", "diverged", "frac_diverged",
-    }
-    # NOTE: this is a denylist, so every new per-trial metric must be added here or it
-    # gets mistaken for a randomized parameter and shows up as a spurious NaN row.
+def _theta_columns(rows: List[Dict], declared: Optional[Sequence[str]]) -> List[str]:
+    """Which CSV columns are randomized parameters, as recorded by the sweep."""
     if not rows:
         return []
-    return sorted(k for k in rows[0] if k not in known)
+    if not declared:
+        raise SystemExit(
+            "summary.json has no `theta_columns`; re-run the sweep to produce it."
+        )
+    return sorted(c for c in declared if c in rows[0])
 
 
 def fig_return_ecdf(rows: List[Dict], out_path: str):
@@ -109,11 +100,14 @@ def fig_return_ecdf(rows: List[Dict], out_path: str):
     ax.set_xlabel("Mean per-step reward")
     ax.set_ylabel("Cumulative fraction of trials")
     ax.set_title("Return distribution: domain shift vs nominal", color=_INK, fontsize=11, loc="left")
-    leg = ax.legend(frameon=False, fontsize=9, loc="lower right")
+    # Both curves rise steeply into the lower-right corner, so a legend there sits on top
+    # of the lines; anchor at upper-left instead, where the curves are flat near y=0.
+    leg = ax.legend(frameon=True, fontsize=9, loc="upper left",
+                     facecolor=_SURFACE, edgecolor=_BASELINE, framealpha=0.95)
     for text in leg.get_texts():
         text.set_color(_INK_SECONDARY)
     fig.tight_layout()
-    fig.savefig(out_path, facecolor=_SURFACE)
+    fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -138,12 +132,19 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
         patch.set_edgecolor(_SURFACE)
         patch.set_linewidth(1.0)
     ax.axvline(0.0, color=_INK_MUTED, linewidth=1.2, linestyle=(0, (3, 2)), zorder=3)
+    # Per-step return divides by steps_survived, so pairs that fall at very different
+    # step counts land far out in the tail (see METRICS.md, "Censoring bias"). A linear
+    # y-axis makes the near-zero bulk unreadable once that tail exists; log-scale keeps
+    # both visible without changing the bins or hiding the outliers.
+    ax.set_yscale("symlog", linthresh=1)
     _style_axes(ax)
-    ax.set_xlabel("Δ mean reward   (nominal-parameter − true-parameter planner, same plant & seed)")
-    ax.set_ylabel("Trial count")
+    ax.set_xlabel("\n".join(textwrap.wrap(
+        "Δ mean reward (nominal-parameter − true-parameter planner, same plant & seed). "
+        "Confounded by unequal survival time -- see METRICS.md.", width=60)))
+    ax.set_ylabel("Trial count (log)")
     ax.set_title("Cost of planning with the wrong model", color=_INK, fontsize=11, loc="left")
     fig.tight_layout()
-    fig.savefig(out_path, facecolor=_SURFACE)
+    fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -169,18 +170,17 @@ def fig_survival(rows: List[Dict], out_path: str):
     ax.set_ylabel("Survival rate (never fell)")
     ax.set_title("Full-episode survival", color=_INK, fontsize=11, loc="left")
     fig.tight_layout()
-    fig.savefig(out_path, facecolor=_SURFACE)
+    fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")
     plt.close(fig)
 
 
-def fig_sensitivity(rows: List[Dict], out_path: str):
+def fig_sensitivity(rows: List[Dict], theta_cols: List[str], out_path: str):
     by_trial = {}
     for r in rows:
         by_trial.setdefault(int(r["trial"]), {})[r["group"]] = r
     paired = [d for d in by_trial.values() if GROUP_NOMINAL_PLANNER in d and GROUP_TRUE_PLANNER in d]
     if not paired:
         return
-    theta_cols = _theta_columns(rows)
     theta_cols = [c for c in theta_cols if all(d[GROUP_NOMINAL_PLANNER].get(c) is not None for d in paired)]
     if not theta_cols:
         return
@@ -213,9 +213,11 @@ def fig_sensitivity(rows: List[Dict], out_path: str):
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
 
-    fig.suptitle("Per-parameter sensitivity of planner model error", color=_INK, fontsize=12, x=0.02, ha="left")
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
-    fig.savefig(out_path, facecolor=_SURFACE)
+    fig.suptitle("Per-parameter sensitivity of planner model error "
+                 "(x-axis of each panel is the confounded return delta -- see METRICS.md)",
+                 color=_INK, fontsize=11, x=0.02, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 1 - 0.5 / (3.2 * nrows + 0.5)))
+    fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -290,7 +292,8 @@ def _standardized_effect(x: np.ndarray, y: np.ndarray, n_boot: int = 2000,
     }
 
 
-def fig_sensitivity_summary(rows: List[Dict], out_path: str, csv_path: str):
+def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_path: str,
+                            csv_path: str):
     """One bar per randomization axis, ranked by how much it moves the paired delta.
 
     Two responses side by side because they disagree in an informative way: mean reward
@@ -304,7 +307,6 @@ def fig_sensitivity_summary(rows: List[Dict], out_path: str, csv_path: str):
     if len(paired) < 8:
         return
 
-    theta_cols = _theta_columns(rows)
     groups = _spec_groups([c for c in theta_cols
                            if all(d[GROUP_NOMINAL_PLANNER].get(c) is not None for d in paired)])
     if not groups:
@@ -344,14 +346,18 @@ def fig_sensitivity_summary(rows: List[Dict], out_path: str, csv_path: str):
         ax.set_yticklabels(order, fontsize=9)
         ax.set_xlabel(f"{label}   per 1 SD of parameter", fontsize=9)
 
+    subtitle = textwrap.fill(
+        "Same plant and MPC seed in both arms; only the planner's model differs. Bars: OLS effect "
+        "per 1 SD of the sampled range (left panel is the censoring-confounded return delta -- see "
+        "METRICS.md). Lines: bootstrap 95% CI -- crossing 0 means no detected effect.",
+        width=118)
+    n_subtitle_lines = subtitle.count("\n") + 1
     fig.suptitle("Which model errors hurt the planner most?",
                  color=_INK, fontsize=12.5, x=0.010, y=0.985, ha="left")
-    fig.text(0.010, 0.945,
-             "Same plant and MPC seed in both arms; only the planner's model differs.  Bars: OLS effect per 1 SD of the "
-             "sampled range.  Lines: bootstrap 95% CI — crossing 0 means no detected effect.",
-             fontsize=8.5, color=_INK_SECONDARY, ha="left", va="top")
-    fig.tight_layout(rect=(0, 0, 1, 0.915))
-    fig.savefig(out_path, facecolor=_SURFACE)
+    fig.text(0.010, 0.945, subtitle, fontsize=8.5, color=_INK_SECONDARY, ha="left", va="top")
+    top_margin = 0.915 - 0.02 * max(0, n_subtitle_lines - 1)
+    fig.tight_layout(rect=(0, 0, 1, top_margin))
+    fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")
     plt.close(fig)
 
     with open(csv_path, "w", newline="") as f:
@@ -374,27 +380,30 @@ def main():
     if not rows:
         raise SystemExit(f"No trials found in {args.run}/trials.csv")
 
+    summary_path = os.path.join(args.run, "summary.json")
+    summary: Dict[str, Any] = {}
+    if os.path.exists(summary_path):
+        with open(summary_path) as f:
+            summary = json.load(f)
+
     fig_dir = os.path.join(args.run, "figures")
     os.makedirs(fig_dir, exist_ok=True)
 
     fig_return_ecdf(rows, os.path.join(fig_dir, "return_ecdf.png"))
     has_paired = any(r["group"] == GROUP_TRUE_PLANNER for r in rows)
     if has_paired:
+        theta_cols = _theta_columns(rows, summary.get("theta_columns"))
         fig_paired_delta(rows, os.path.join(fig_dir, "paired_delta_return.png"))
-        fig_sensitivity(rows, os.path.join(fig_dir, "sensitivity.png"))
+        fig_sensitivity(rows, theta_cols, os.path.join(fig_dir, "sensitivity.png"))
         fig_sensitivity_summary(
-            rows,
+            rows, theta_cols,
             os.path.join(fig_dir, "sensitivity_summary.png"),
             os.path.join(args.run, "sensitivity.csv"),
         )
     fig_survival(rows, os.path.join(fig_dir, "survival.png"))
 
-    rand_rows = [r for r in rows if r["group"] == GROUP_NOMINAL_PLANNER]
-    summary_path = os.path.join(args.run, "summary.json")
-    if os.path.exists(summary_path):
-        with open(summary_path) as f:
-            summary = json.load(f)
-    else:
+    if not summary:
+        rand_rows = [r for r in rows if r["group"] == GROUP_NOMINAL_PLANNER]
         summary = {
             "n_trials": len(rand_rows),
             "return_mean": float(np.mean([r["return_mean"] for r in rand_rows])),

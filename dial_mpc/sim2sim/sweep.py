@@ -48,12 +48,28 @@ def _flatten_theta(theta: Dict[str, np.ndarray]) -> Dict[str, float]:
     return row
 
 
-def _select_interesting(pairs: List[Dict[str, Any]], n_keep: int) -> List[Dict[str, Any]]:
+# A trial where the true-parameter planner's return_mean is this much lower (more
+# negative) than the nominal-parameter planner's is always kept, even if every other
+# slot is already spoken for -- see `_select_interesting`.
+TRUE_PLANNER_MUCH_WORSE_FRAC = 0.5
+
+
+def _select_interesting(
+    pairs: List[Dict[str, Any]], n_keep: int,
+    much_worse_frac: float = TRUE_PLANNER_MUCH_WORSE_FRAC,
+) -> List[Dict[str, Any]]:
     """Pick the trial pairs worth keeping a full state log for.
 
-    Three qualitatively different kinds of divergence, taken together rather than just
+    Four qualitatively different kinds of divergence, taken together rather than just
     ranking by |delta return|, because they answer different questions:
 
+      * `true_planner_much_worse` -- the true-parameter planner's return_mean is more than
+        `much_worse_frac` lower than the nominal-parameter planner's. `return_mean` divides
+        by `steps_survived` (see METRICS.md's censoring-bias section), so this is usually
+        the arm that survived *longer* posting the *lower* mean, not genuinely worse
+        control -- exactly the pattern worth a full state log to confirm. Reserved a slot
+        unconditionally: this is the one category a caller explicitly wants guaranteed,
+        so it is not subject to the round-robin below.
       * `survival_flip` -- one arm fell and the other did not. Same plant, same seed, so
         this is purely the planner's model error deciding the episode. The clearest
         possible domain-shift failure, and invisible in a mean.
@@ -63,6 +79,14 @@ def _select_interesting(pairs: List[Dict[str, Any]], n_keep: int) -> List[Dict[s
         draw (sampling noise, or a mismatch that happened to help).
       * `steps_gap` -- largest |delta steps survived|, which catches pairs that both
         eventually fall but at very different times.
+
+    Selection is two-phase: `true_planner_much_worse` trials are reserved first (up to
+    `n_keep`), then the remaining slots are filled round-robin across the other four
+    categories. A straight priority sort (survival flips always first) previously let one
+    crowded category consume every slot -- concretely, a 256-trial run had >=12 distinct
+    `survival_flip` pairs, so they filled all 12 slots and silently dropped the single
+    largest |delta_return| pair in the whole run (tagged only `nominal_planner_better`).
+    Round-robin instead gives every category a turn.
     """
     tagged: Dict[int, Dict[str, Any]] = {}
 
@@ -74,21 +98,55 @@ def _select_interesting(pairs: List[Dict[str, Any]], n_keep: int) -> List[Dict[s
     for p in pairs:
         if bool(p["survived_nominal_planner"]) != bool(p["survived_true_planner"]):
             tag(p, "survival_flip")
+        nom_r, true_r = p["return_nominal_planner"], p["return_true_planner"]
+        if true_r <= nom_r - much_worse_frac * abs(nom_r):
+            tag(p, "true_planner_much_worse")
 
+    # Each bucket is sign-filtered so a tag always means what it says. Without that, a
+    # sweep with fewer pairs than 2 * per_bucket tags the same pair both `worse` and
+    # `better`, and tags `steps_gap` on pairs whose arms survived equally long.
     by_delta = sorted(pairs, key=lambda p: p["delta_return"])
     per_bucket = max(1, n_keep // 4)
-    for p in by_delta[:per_bucket]:
+    for p in [q for q in by_delta if q["delta_return"] < 0][:per_bucket]:
         tag(p, "nominal_planner_worse")
     for p in [q for q in reversed(by_delta) if q["delta_return"] > 0][:per_bucket]:
         tag(p, "nominal_planner_better")
-    for p in sorted(pairs, key=lambda q: -abs(q["delta_steps"]))[:per_bucket]:
+    for p in [q for q in sorted(pairs, key=lambda q: -abs(q["delta_steps"]))
+              if q["delta_steps"] != 0][:per_bucket]:
         tag(p, "steps_gap")
 
-    def priority(e: Dict[str, Any]) -> tuple:
-        # survival flips first, then by how far apart the two arms ended up
-        return (0 if "survival_flip" in e["reasons"] else 1, -abs(e["pair"]["delta_return"]))
+    by_extremity = lambda e: -abs(e["pair"]["delta_return"])
 
-    return [e for e in sorted(tagged.values(), key=priority)][:n_keep]
+    selected: Dict[int, Dict[str, Any]] = {}
+    for e in sorted((e for e in tagged.values() if "true_planner_much_worse" in e["reasons"]),
+                     key=by_extremity):
+        if len(selected) >= n_keep:
+            break
+        selected[e["pair"]["trial"]] = e
+
+    round_robin_categories = ["survival_flip", "nominal_planner_worse",
+                              "nominal_planner_better", "steps_gap"]
+    by_category = {
+        c: sorted((e for e in tagged.values() if c in e["reasons"]), key=by_extremity)
+        for c in round_robin_categories
+    }
+    cursor = {c: 0 for c in round_robin_categories}
+    progressed = True
+    while len(selected) < n_keep and progressed:
+        progressed = False
+        for c in round_robin_categories:
+            if len(selected) >= n_keep:
+                break
+            lst = by_category[c]
+            while cursor[c] < len(lst) and lst[cursor[c]]["pair"]["trial"] in selected:
+                cursor[c] += 1
+            if cursor[c] < len(lst):
+                e = lst[cursor[c]]
+                selected[e["pair"]["trial"]] = e
+                cursor[c] += 1
+                progressed = True
+
+    return list(selected.values())
 
 
 def _cache_size(fn: Any) -> int:
@@ -127,6 +185,12 @@ def _write_interesting(
     the sweep ran (including the seed and the randomization ranges), `trials_csv` holds
     the full metric row, and `theta` is the realised parameter draw, also duplicated
     inside each .npz so a trajectory file is self-describing if it gets moved.
+
+    Each trial gets its own subdirectory (`trial_0168/nominal_planner.npz`, ...) instead
+    of flat `trial_0168_nominal_planner.npz` files, so `dial_mpc.sim2sim.reproduce` can
+    write a reproduced trial in the identical shape under `reproduced/` and both are
+    handled by the same `view.generate_trial_outputs`. Breaks index.json compatibility
+    with runs written before this change -- there is no reader for the old flat layout.
     """
     selected = _select_interesting(pairs, n_keep)
     if not selected:
@@ -138,14 +202,17 @@ def _write_interesting(
     for entry in selected:
         pair = entry["pair"]
         i = pair["trial"]
+        trial_dir_name = f"trial_{i:04d}"
+        trial_dir = os.path.join(out_dir, trial_dir_name)
+        os.makedirs(trial_dir, exist_ok=True)
         files = {}
         for group in GROUPS:
             log = logs.get(i, {}).get(group)
             if log is None:
                 continue
-            fname = f"trial_{i:04d}_{group}.npz"
+            fname = f"{group}.npz"
             np.savez_compressed(
-                os.path.join(out_dir, fname),
+                os.path.join(trial_dir, fname),
                 env_name=np.asarray(dial_config.env_name),
                 trial=np.asarray(i),
                 group=np.asarray(group),
@@ -156,6 +223,7 @@ def _write_interesting(
             files[group] = fname
         index.append({
             "trial": i,
+            "dir": trial_dir_name,
             "seed": pair["seed"],
             "reasons": entry["reasons"],
             "delta_return": pair["delta_return"],
@@ -177,14 +245,16 @@ def _write_interesting(
         "env_name": dial_config.env_name,
         "log_rate_hz": 50.0,
         "note": (
-            "Each trial's two .npz files are the SAME theta-perturbed plant driven at the "
-            "SAME MPC seed; they differ only in what the planner was told. "
+            "Each trial's two .npz files live under `<dir>/` (e.g. trial_0168/) and are "
+            "the SAME theta-perturbed plant driven at the SAME MPC seed; they differ only "
+            "in what the planner was told. "
             f"'{GROUP_NOMINAL_PLANNER}' planned with the nominal parameters, "
             f"'{GROUP_TRUE_PLANNER}' planned with the plant's true parameters, so the "
             "difference between them is the planner's model error alone. `theta` is the "
-            "realised draw and applies to BOTH files. Reproduce by re-running the sweep "
-            "with the config in `config` (same seed and n_trials); trial index and seed "
-            "are recorded per entry."
+            "realised draw and applies to BOTH files. Reproduce a single trial exactly "
+            "with `dial-mpc-sim2sim-reproduce --run <run_dir> --trial <n>` (uses the "
+            "seed and theta from `trials_csv`/this index); trial index and seed are "
+            "recorded per entry."
         ),
         "entries": index,
     }
@@ -227,15 +297,13 @@ def main():
 
     print(f"Building envs for '{dial_config.env_name}' (plant is theta-perturbed in BOTH arms)")
     planner_env, plant_env = build_envs(dial_config.env_name, env_config)
-    # Two distinct env objects is a hard requirement: one shared env would have the plant's
-    # swap active while the planner traces.
-    assert planner_env is not plant_env, "planner and plant must be distinct env objects"
     stepper = PlantStepper(plant_env)
+    nominal = stepper.nominal
 
     specs = resolve_specs(
         drc.params,
-        stepper.nominal_sys,
-        config_arrays={"kp": stepper.nominal_kp, "kd": stepper.nominal_kd},
+        nominal.sys,
+        config_arrays={"kp": nominal.kp, "kd": nominal.kd},
     )
     print(f"Domain-randomization axes ({len(specs)}): " + ", ".join(s.name for s in specs))
 
@@ -243,16 +311,16 @@ def main():
     # the other ~337 as constants (see PlannerModel for the measured cost of not doing so).
     sys_fields = sorted({sp.field for sp in specs if sp.target == "sys"})
     planner = PlannerStepper(
-        planner_env, stepper.nominal_sys, sys_fields, stepper.nominal_kp, stepper.nominal_kd
+        planner_env, nominal.sys, sys_fields, nominal.kp, nominal.kd
     )
     # MBDPI must be built with the planner's step fn, and after it.
     mbdpi = MBDPI(dial_config, planner_env, model_step_fn=planner.step_fn)
     diffuse = DiffuseStepper(mbdpi, dial_config)
-    assert planner_env.action_size == plant_env.action_size
 
     if drc.terminate_on_physical_limits:
-        # Both envs, so the planner optimises against the same failure rule the plant is
-        # judged by (`done` feeds reward_alive inside the imagined rollouts too).
+        # This decides when the PLANT's episode ends, which is the whole point. Set on the
+        # planner env too only for consistency: `rollout_us` never truncates on `done`, and
+        # UnitreeH1LocoEnv weights reward_alive at 0.0, so planner-side it is a no-op today.
         planner_env.terminate_on_physical_limits = True
         plant_env.terminate_on_physical_limits = True
         print("Termination: physical joint limits (not the narrower action-scaling band)")
@@ -271,13 +339,18 @@ def main():
     rows: List[Dict[str, Any]] = []
     pairs: List[Dict[str, Any]] = []
     logs: Dict[int, Dict[str, Dict[str, np.ndarray]]] = {}
+    theta_columns: List[str] = []
 
     with tqdm(range(drc.n_trials), desc="Sim2sim trials") as pbar:
         for i in pbar:
-            rng, theta_rng, run_rng = jax.random.split(rng, 3)
-            trial_seed = int(jax.random.randint(theta_rng, (), 0, 2**31 - 1))
+            rng, theta_rng = jax.random.split(rng)
             theta = sample_theta(theta_rng, specs)
-            sys, kp, kd = apply_theta(stepper.nominal_sys, stepper.nominal_kp, stepper.nominal_kd, theta, specs)
+            # The MPC key is derived from an explicit integer that goes into the CSV, so one
+            # trial can be replayed without replaying the whole sweep's RNG stream. Both arms
+            # share it -- that identity is what makes the pair a controlled comparison.
+            trial_seed = (drc.seed * 1_000_003 + i) % (2**31 - 1)
+            run_rng = jax.random.PRNGKey(trial_seed)
+            sys, kp, kd = apply_theta(nominal.sys, nominal.kp, nominal.kd, theta, specs)
 
             plant_model = Model(sys, kp, kd)
             if i == 0:
@@ -294,6 +367,8 @@ def main():
             row = _trial_row(i, trial_seed, result)
             row["group"] = GROUP_NOMINAL_PLANNER
             rows.append(row)
+            if not theta_columns:
+                theta_columns = sorted(_flatten_theta(result.theta))
 
             if result.rollout is not None:
                 logs.setdefault(i, {})[GROUP_NOMINAL_PLANNER] = result.rollout
@@ -350,6 +425,8 @@ def main():
     summary = {
         "n_trials": drc.n_trials,
         "paired": drc.paired,
+        # So `analyze.py` knows which CSV columns are randomization axes without a denylist.
+        "theta_columns": theta_columns,
         "env_name": dial_config.env_name,
         "n_steps": dial_config.n_steps,
         "return_mean": float(np.nanmean([r["return_mean"] for r in rand_rows])),
@@ -400,13 +477,10 @@ def main():
             summary["equal_horizon_delta_return_mean"] = float(d_eh.mean())
             summary["equal_horizon_delta_return_sem"] = float(
                 d_eh.std(ddof=1) / np.sqrt(len(d_eh)))
-    # Compile guards: these are fixed costs that must NOT grow with the number of trials.
-    # If a parameter draw forced a retrace, runtime would collapse and -- worse -- the two
-    # arms could end up running different compiled code, making them incomparable.
-    # `plant_step` is 2 rather than 1 for a benign reason that predates this harness: the
-    # very first step of an episode is applied to `Y0[0]` sliced from a freshly-allocated
-    # zeros array, and later steps to `Y0[0]` coming out of the diffusion, which have
-    # different avals. Verified stable at 2 across 16+ trial pairs.
+    # Compile guards: fixed costs that must NOT grow with the number of trials. A draw that
+    # forced a retrace would collapse runtime and, worse, could leave the two arms running
+    # different compiled code. `plant_step` settles at 2 (the episode's first action comes
+    # from a freshly-allocated zeros array, later ones out of the diffusion); that is benign.
     caches = {
         "diffuse_init": _cache_size(diffuse.diffuse_init_jit),
         "diffuse": _cache_size(diffuse.diffuse_jit),

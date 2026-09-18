@@ -30,13 +30,6 @@ from brax.base import System
 # (n_frames = dt / timestep is fixed at env construction).
 _FORBIDDEN_SYS_FIELDS = {"opt.timestep"}
 
-# sys fields that, if randomized, require refreshing env-side cached attributes
-# (BaseEnv.__init__ snapshots physical_joint_range/joint_range/joint_torque_range from
-# sys at construction time). runner.py's plant swap always refreshes these
-# unconditionally when sys != nominal, which is correct and cheap regardless of which
-# fields actually changed -- this set exists only to document why.
-SYS_FIELDS_WITH_CACHED_DEPENDENTS = frozenset({"actuator_ctrlrange", "jnt_range"})
-
 
 @dataclass
 class ParamSpec:
@@ -90,7 +83,7 @@ class DomainRandConfig:
     # Judge `done` against the model's real joint limits instead of the env's hand-tuned
     # action-scaling band. The band is far tighter than physical limits, so leaving this
     # off ends episodes on ordinary tracking error rather than on a fall.
-    terminate_on_physical_limits: bool = True
+    terminate_on_physical_limits: bool = False
     params: Dict[str, Dict[str, Any]] = dc_field(default_factory=dict)
 
 

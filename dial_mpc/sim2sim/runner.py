@@ -23,7 +23,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from dataclasses import dataclass
-from typing import Any, Callable, ContextManager, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, cast
+from typing import Callable, ContextManager, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -40,15 +40,11 @@ from dial_mpc.core.dial_core import MBDPI
 from dial_mpc.envs.base_env import BaseEnv
 from dial_mpc.utils.function_utils import global_to_body_velocity
 
-# Signatures of the jitted closures below. `jax.jit` returns an opaque `Wrapped` whose
-# return type is Any, which silently erases `State` at every call site; naming the
-# signatures here is what lets a type checker follow `state` through the rollout loop.
 class Model(NamedTuple):
     """A complete set of dynamics parameters: the MJX model plus the controller gains.
 
-    A NamedTuple is a pytree, so a `Model` can be passed straight through `jax.jit` as a
-    traced argument. Keeping the three together in one node (rather than three loose
-    arguments) means the plant model and the planner model are structurally identical by
+    A NamedTuple is a pytree, so it travels through `jax.jit` as a traced argument. Keeping
+    the three in one node makes the plant and planner models structurally identical by
     construction, which is what lets both experiment arms share a single compilation.
     """
 
@@ -76,6 +72,8 @@ class PlannerModel(NamedTuple):
     kd: jax.Array
 
 
+# `jax.jit` returns an opaque wrapper whose return type is Any, which erases `State` at
+# every call site; these aliases are what let a type checker follow `state` through the loop.
 StepFn = Callable[[Model, State, jax.Array], State]
 ResetFn = Callable[[Model, jax.Array], State]
 PlannerStepFn = Callable[[PlannerModel, State, jax.Array], State]
@@ -100,6 +98,16 @@ def make_model_swap(env: BaseEnv) -> Callable[..., ContextManager[BaseEnv]]:
     refresh_joint_range = bool(
         np.array_equal(np.asarray(env.joint_range), np.asarray(env.physical_joint_range))
     )
+    # The swap rewrites physical_joint_range wholesale from sys.jnt_range, so an env that
+    # reshapes it after BaseEnv.__init__ (UnitreeH1PushCrateEnv drops its last row) would be
+    # silently un-truncated -- and `termination_joint_range` would then mismatch
+    # `joint_range`'s row count. Refuse up front rather than fail deep inside a trace.
+    if len(env.physical_joint_range) != len(env.sys.jnt_range[1:]):
+        raise ValueError(
+            f"{type(env).__name__} reshapes physical_joint_range after BaseEnv.__init__ "
+            f"({len(env.physical_joint_range)} rows vs {len(env.sys.jnt_range[1:])} in "
+            "sys.jnt_range[1:]); the model swap cannot reconstruct it."
+        )
 
     @contextlib.contextmanager
     def _swap(sys: System, kp: jax.Array, kd: jax.Array):
@@ -111,10 +119,9 @@ def make_model_swap(env: BaseEnv) -> Callable[..., ContextManager[BaseEnv]]:
         try:
             env.sys = sys
             env._config = dataclasses.replace(o_cfg, kp=kp, kd=kd)
-            # BaseEnv.__init__ snapshots these three from sys at construction time
-            # (base_env.py:23-25); if the randomized fields feed them, refresh so
-            # act2joint/act2tau/termination see the randomized model, not the nominal
-            # one baked in at __init__.
+            # BaseEnv.__init__ snapshots these from sys; refresh unconditionally so
+            # act2joint/act2tau/termination see the swapped model rather than the
+            # jnt_range/actuator_ctrlrange baked in at construction.
             env.physical_joint_range = sys.jnt_range[1:]
             env.joint_torque_range = sys.actuator_ctrlrange
             if refresh_joint_range:
@@ -129,14 +136,9 @@ def make_model_swap(env: BaseEnv) -> Callable[..., ContextManager[BaseEnv]]:
 
 
 def build_envs(env_name: str, env_config: BaseEnvConfig) -> Tuple[BaseEnv, BaseEnv]:
-    """Build two independent env instances from the same registered env/config.
-
-    Two instances (rather than one env reused) so that mutating `plant_env.sys` inside
-    the swap contextmanager can never leak into the planner env that `MBDPI` was built
-    against.
-    """
-    # get_environment is typed as returning brax's generic `Env`; every env registered
-    # by dial_mpc.envs derives from BaseEnv, which is the surface this harness uses.
+    """Two independent env instances, so the plant's attribute swap can never leak into
+    the planner env that `MBDPI` was built against."""
+    # get_environment is typed as brax's generic `Env`; every dial_mpc env derives BaseEnv.
     planner_env = cast(BaseEnv, brax_envs.get_environment(env_name, config=env_config))
     plant_env = cast(BaseEnv, brax_envs.get_environment(env_name, config=env_config))
     return planner_env, plant_env
@@ -189,19 +191,6 @@ class PlantStepper:
 
         self.step_jit = cast(StepFn, jax.jit(_step))
         self.reset_jit = cast(ResetFn, jax.jit(_reset))
-
-    # Back-compat aliases; `resolve_specs` and the sweep still speak in loose arrays.
-    @property
-    def nominal_sys(self) -> System:
-        return self.nominal.sys
-
-    @property
-    def nominal_kp(self) -> jax.Array:
-        return self.nominal.kp
-
-    @property
-    def nominal_kd(self) -> jax.Array:
-        return self.nominal.kd
 
 
 class PlannerStepper:
@@ -314,12 +303,10 @@ class TrialResult:
     return_mean: float
     steps_survived: int
     survived: bool
-    # True if the rollout produced a non-finite reward/state. Tracked separately from
-    # `survived` because a NaN reward makes `done` NaN too, and `bool(nan > 0.5)` is
-    # False -- so a diverged trial would otherwise be recorded as a perfect episode.
+    # Tracked separately from `survived`: a NaN reward makes `done` NaN too, and
+    # `bool(nan > 0.5)` is False, so a diverged trial would otherwise look like a perfect one.
     diverged: bool
-    # Mean fraction of the planner's sampled rollouts that diverged, per MPC step. Small
-    # nonzero values are normal and harmless (those samples are simply rejected).
+    # Mean fraction of the planner's sampled rollouts rejected as non-finite, per MPC step.
     frac_diverged: float
     plan_return_mean: float
     optimism_gap: float
@@ -327,8 +314,7 @@ class TrialResult:
     vel_err: float
     yaw_rate_err: float
     torque_rms: float
-    # Per-control-step state log; always populated (it costs ~70 floats/step and the
-    # sweep decides which trials are worth writing to disk).
+    # Always populated; the sweep decides which trials are worth writing to disk.
     rollout: Optional[Dict[str, np.ndarray]] = None
 
 
@@ -379,11 +365,8 @@ def run_trial(
     n_steps = dial_config.n_steps
 
     def pipeline_of(st: State) -> PipelineState:
-        """`State.pipeline_state` is Optional[...] on brax's generic env State, and is
-        typed as the backend-agnostic `brax.base.State`. Every dial_mpc env runs the mjx
-        backend, whose pipeline state also carries the `mjx.Data` fields (`ctrl`, `qpos`,
-        `qacc`); narrowing here once keeps the metric code below both checked and
-        navigable instead of silently Any."""
+        """Narrow brax's Optional, backend-agnostic pipeline state to the mjx one, whose
+        `ctrl`/`qpos`/`qvel` the metrics below need."""
         ps = st.pipeline_state
         if ps is None:
             raise RuntimeError("env returned a State with no pipeline_state")
@@ -403,7 +386,7 @@ def run_trial(
     survived = True
     diverged = False
     frac_div: List[float] = []
-    prev_xbar1: Optional[jax.Array] = None
+    prev_qbar1: Optional[jax.Array] = None
 
     # Recorded every control step (env.dt = 0.02 s -> 50 Hz for the H1 configs), which
     # is the rate the MPC actually commands at; there is no sub-step logging because
@@ -428,14 +411,14 @@ def run_trial(
             survived = False
             break
         return_sum += r
-        torque_sq_sum += float(jnp.sum(jnp.square(ps.ctrl)))
+        torque_sq_sum += float(jnp.mean(jnp.square(ps.ctrl)))
 
         vb, ab = _body_vel(ps, stepper.torso_idx)
         vel_errs.append(float(jnp.linalg.norm(vb[:2] - state.info["vel_tar"][:2])))
         yaw_errs.append(float(jnp.abs(ab[-1] - state.info["ang_vel_tar"][-1])))
 
-        if prev_xbar1 is not None:
-            pred_errs.append(float(jnp.linalg.norm(ps.x.pos - prev_xbar1)))
+        if prev_qbar1 is not None:
+            pred_errs.append(float(jnp.linalg.norm(ps.q - prev_qbar1)))
 
         log["qpos"].append(np.asarray(ps.qpos))
         log["qvel"].append(np.asarray(ps.qvel))
@@ -458,17 +441,25 @@ def run_trial(
         Y0 = mbdpi.shift(Y0)
         diffuse_fn = diffuse.diffuse_init_jit if t == 0 else diffuse.diffuse_jit
         rng, Y0, info = diffuse_fn(planner_model, rng, Y0, state)
-        plan_returns.append(float(info["rews"][-1].mean()))
-        if "frac_diverged" in info:
-            frac_div.append(float(np.asarray(info["frac_diverged"]).mean()))
-        # xbar[-1] is the last diffusion iterate's weighted-mean predicted trajectory,
-        # under whichever PLANNER model this trial was given, starting from the state just
-        # reached above. xbar[-1][1] is its 1-step-ahead prediction -- compared against the
-        # plant's actual next state at the top of the following iteration. When the planner
-        # has the true parameters this should be near zero (not exactly zero: xbar is a
-        # weighted mean over the sample set, not a rollout of the applied Y0[0]), which is
-        # the sharpest end-to-end evidence that the planner really sees theta.
-        prev_xbar1 = info["xbar"][-1][1]
+        plan_returns.append(float(info["rew_plan"][-1]))
+        frac_div.append(float(np.asarray(info["frac_diverged"]).mean()))
+        # The planner's 1-step prediction of the configuration the plant will reach next,
+        # under whichever PLANNER model this trial was given: qbar[-1] is the last diffusion
+        # iterate's weighted-mean predicted trajectory from the state just reached above, and
+        # its index 0 is the configuration after applying us[0] == Y0[0] -- exactly the action
+        # the next iteration applies to the plant. (`rollout_us` emits post-step states only;
+        # there is no initial state at index 0.)
+        #
+        # `q`, not `x.pos`: brax fills `x` from `data.xpos` after `mjx.step`, and MuJoCo runs
+        # forward kinematics *before* integrating, so `x` lags `q` by one step. Comparing
+        # x.pos against x.pos measures nothing (both sides are kinematics of the same qpos,
+        # agreeing to ~2e-7); `q` is post-integration and correctly aligned.
+        #
+        # Near zero with the true parameters, though not exactly: qbar is a weighted mean
+        # over the sample set, not a rollout of the applied Y0[0]. Units are mixed (metres
+        # for the free-joint translation, unitless quaternion, radians for the joints) --
+        # it is a diagnostic scalar, not a physical distance.
+        prev_qbar1 = info["qbar"][-1][0]
 
     plan_return_mean = float(np.mean(plan_returns)) if plan_returns else 0.0
     return_mean = return_sum / steps_survived if steps_survived > 0 else 0.0

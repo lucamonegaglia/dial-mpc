@@ -43,15 +43,8 @@ def rollout_us(step_env, state, us):
 
 
 def rollout_us_model(step_env_model, model, state, us):
-    """Like `rollout_us`, but the physics model is a *traced argument* rather than a
-    Python closure constant.
-
-    `step_env_model(model, state, u)` receives `model` -- an opaque pytree, whose contents
-    are the caller's business -- so the planner can be rolled out under an arbitrary set of
-    dynamics parameters without rebuilding (and therefore recompiling) anything. Used by
-    the sim2sim harness to give the planner the plant's true parameters; `rollout_us` above
-    is untouched and remains the path every existing caller takes.
-    """
+    """Like `rollout_us`, but the physics model is a traced argument rather than a closure
+    constant, so a caller can roll out under arbitrary dynamics without recompiling."""
 
     def step(state, u):
         state = step_env_model(model, state, u)
@@ -192,11 +185,11 @@ class MBDPI:
 
         logp0 = (rews_safe - rew_Ybar_i) / std / self.args.temp_sample
         logp0 = jnp.where(finite, logp0, -jnp.inf)  # diverged samples get zero weight
+        logp0 = jnp.where(finite.any(), logp0, 0.0)  # all diverged -> uniform, not all-NaN
 
         weights = jax.nn.softmax(logp0)
-        # Zeroing the diverged samples' trajectories is not redundant with the zero
-        # weights above: 0 * NaN is NaN, so without this the weighted means below would
-        # still come out NaN.
+        # Zero weights are not enough: 0 * NaN is NaN, so the diverged samples' own
+        # trajectories must be zeroed before the weighted means below.
         keep3 = finite[:, None, None]
         Y0s_k = jnp.where(keep3, Y0s, 0.0)
         qss_k = jnp.where(keep3, qss, 0.0)
@@ -212,7 +205,13 @@ class MBDPI:
         xbar = jnp.einsum("n,nijk->ijk", weights, xss_k)
 
         info = {
-            "rews": rews,
+            # censored, not raw: a single diverged sample would otherwise make every
+            # downstream mean of this NaN.
+            "rews": rews_safe,
+            # The return the planner actually expects from the plan it just committed to.
+            # `rews_safe.mean()` is NOT that: it averages the whole deliberately-perturbed
+            # sample cloud, so one near-diverging-but-finite sample dominates it.
+            "rew_plan": jnp.dot(weights, rews_safe),
             "frac_diverged": 1.0 - finite.mean(),
             "qbar": qbar,
             "qdbar": qdbar,

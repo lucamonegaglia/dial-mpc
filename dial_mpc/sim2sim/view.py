@@ -1,7 +1,9 @@
 """dial-mpc-sim2sim-view: inspect one saved sim2sim trajectory.
 
-Reads the 50 Hz state logs written to `<run>/interesting/` by `dial-mpc-sim2sim-eval`
-and renders them two ways:
+Reads the 50 Hz state logs written one subdirectory per trial (`<run>/interesting/
+trial_0007/{group}.npz`) by `dial-mpc-sim2sim-eval`, or the identically-shaped
+`<run>/reproduced/trial_0007/` written by `dial_mpc.sim2sim.reproduce`, and renders them
+two ways:
 
   * a side-by-side time-series comparison of the two arms of the same trial -- same
     theta-perturbed plant and MPC seed, differing only in the planner's model (default);
@@ -13,7 +15,7 @@ Usage:
     dial-mpc-sim2sim-view --run <run_dir>                 # list what was saved
     dial-mpc-sim2sim-view --run <run_dir> --trial 7       # compare both arms of trial 7
     dial-mpc-sim2sim-view --run <run_dir> --trial 7 --html
-    dial-mpc-sim2sim-view --traj <run>/interesting/trial_0007_nominal_planner.npz
+    dial-mpc-sim2sim-view --traj-dir <run>/reproduced/trial_0168 --html
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, Optional, cast
 
 import numpy as np
 
@@ -32,9 +34,7 @@ import matplotlib.pyplot as plt
 
 from dial_mpc.sim2sim.groups import DISPLAY, GROUP_NOMINAL_PLANNER, GROUP_TRUE_PLANNER
 from dial_mpc.sim2sim.analyze import (
-    _BASELINE,
     _BLUE,
-    _GRID,
     _INK,
     _INK_MUTED,
     _INK_SECONDARY,
@@ -58,6 +58,16 @@ def load_traj(path: str) -> Dict[str, Any]:
         if key in out:
             out[key] = int(out[key])
     return out
+
+
+def load_traj_dir(trial_dir: str) -> Dict[str, Dict[str, Any]]:
+    """Load every group's .npz in a per-trial directory (e.g. `interesting/trial_0168/`
+    or `reproduced/trial_0168/`), keyed by group name (the filename stem)."""
+    trajs = {}
+    for fn in sorted(os.listdir(trial_dir)):
+        if fn.endswith(".npz"):
+            trajs[fn[:-4]] = load_traj(os.path.join(trial_dir, fn))
+    return trajs
 
 
 def load_index(run_dir: str) -> Optional[Dict[str, Any]]:
@@ -184,29 +194,40 @@ def render_html(traj: Dict[str, Any], run_dir: str, out_path: str) -> None:
     print(f"Wrote {out_path}  (open in a browser)")
 
 
+def generate_trial_outputs(run_dir: str, trial_dir: str, title: str, html: bool = False) -> None:
+    """Given a directory holding one trial's per-group .npz logs (`<group>.npz`), write
+    `compare.png` there, and optionally `<group>.html` for each group.
+
+    The one place that turns saved .npz logs into figures/playbacks, shared by this
+    module's own `--trial`/`--traj-dir` modes and by `dial_mpc.sim2sim.reproduce`, which
+    writes its output in the identical per-trial-directory shape under `reproduced/`.
+    """
+    trajs = load_traj_dir(trial_dir)
+    fig_compare(trajs, os.path.join(trial_dir, "compare.png"), title)
+    if html:
+        for group, traj in trajs.items():
+            render_html(traj, run_dir, os.path.join(trial_dir, f"{group}.html"))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", type=str, default=None, help="a sim2sim run directory")
     parser.add_argument("--trial", type=int, default=None,
                         help="trial index to compare (needs --run)")
-    parser.add_argument("--traj", type=str, default=None, help="a single .npz state log")
-    parser.add_argument("--html", action="store_true", help="also write a brax 3D playback")
-    parser.add_argument("--out", type=str, default=None, help="output path override")
+    parser.add_argument("--traj-dir", type=str, default=None,
+                        help="a per-trial directory of .npz logs, "
+                             "e.g. <run>/interesting/trial_0168 or <run>/reproduced/trial_0168")
+    parser.add_argument("--html", action="store_true", help="also write brax 3D playbacks")
     args = parser.parse_args()
 
-    if args.traj:
-        traj = load_traj(args.traj)
-        run_dir = os.path.dirname(os.path.dirname(os.path.abspath(args.traj)))
-        stem = os.path.splitext(os.path.basename(args.traj))[0]
-        out = args.out or os.path.join(os.path.dirname(args.traj), stem + ".png")
-        fig_compare({str(traj.get("group", "trajectory")): traj}, out,
-                    f"Trial {traj.get('trial')} — {traj.get('group')}")
-        if args.html:
-            render_html(traj, run_dir, os.path.splitext(out)[0] + ".html")
+    if args.traj_dir:
+        trial_dir = os.path.abspath(args.traj_dir)
+        run_dir = os.path.dirname(os.path.dirname(trial_dir))
+        generate_trial_outputs(run_dir, trial_dir, os.path.basename(trial_dir), html=args.html)
         return
 
     if not args.run:
-        raise SystemExit("Pass --run <run_dir> (optionally with --trial N) or --traj <file.npz>")
+        raise SystemExit("Pass --run <run_dir> (optionally with --trial N) or --traj-dir <dir>")
 
     manifest = load_index(args.run)
     if manifest is None:
@@ -223,12 +244,10 @@ def main():
         have = ", ".join(str(e["trial"]) for e in manifest["entries"])
         raise SystemExit(f"Trial {args.trial} was not saved. Available: {have}")
 
-    base = os.path.join(args.run, "interesting")
-    trajs = {g: load_traj(os.path.join(base, fn)) for g, fn in entry["files"].items()}
+    trial_dir = os.path.join(args.run, "interesting", entry["dir"])
     title = (f"Trial {entry['trial']} — Δreturn {entry['delta_return']:+.4f}, "
              f"Δsteps {entry['delta_steps']:+d}  ({', '.join(entry['reasons'])})")
-    out = args.out or os.path.join(base, f"trial_{entry['trial']:04d}_compare.png")
-    fig_compare(trajs, out, title)
+    generate_trial_outputs(os.path.abspath(args.run), trial_dir, title, html=args.html)
 
     print("\nParameters for this trial (theta):")
     for k, v in entry["theta"].items():
@@ -240,11 +259,6 @@ def main():
                   f"[{float(arr.min()):+.4f}, {float(arr.max()):+.4f}]  ({arr.size} elements)")
     print(f"\nFull metric row: {manifest['trials_csv']} (trial={entry['trial']}), "
           f"config: {manifest['config']}")
-
-    if args.html:
-        for group, traj in trajs.items():
-            render_html(traj, args.run,
-                        os.path.join(base, f"trial_{entry['trial']:04d}_{group}.html"))
 
 
 if __name__ == "__main__":

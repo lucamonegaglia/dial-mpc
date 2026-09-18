@@ -25,25 +25,3 @@ DISPLAY = {
     GROUP_NOMINAL_PLANNER: "Nominal-parameter planner",
     GROUP_TRUE_PLANNER: "True-parameter planner",
 }
-
-SHORT = {
-    GROUP_NOMINAL_PLANNER: "nominal planner",
-    GROUP_TRUE_PLANNER: "true planner",
-}
-
-# Runs produced before the control arm was redefined used these labels. The mapping lets
-# old CSVs still be read, but it is NOT a rename: the old "nominal" arm ran a *nominal
-# plant*, which is a different experiment, so its deltas are not comparable with new ones.
-# `analyze.load_trials` applies this and warns.
-LEGACY_GROUPS = {
-    "randomized": GROUP_NOMINAL_PLANNER,
-    "nominal": GROUP_TRUE_PLANNER,
-}
-
-LEGACY_WARNING = (
-    "This run uses the pre-{ts} group labels. Its control arm was a NOMINAL PLANT with a "
-    "nominal planner, not a theta-perturbed plant with a true-parameter planner, so its "
-    "paired deltas measure something different (planner error + intrinsic plant "
-    "difficulty, rather than planner error alone). Figures are labelled with the new "
-    "names for convenience -- do not compare these numbers against a new run."
-).format(ts="2026-09-18")

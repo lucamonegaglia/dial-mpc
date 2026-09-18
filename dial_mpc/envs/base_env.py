@@ -23,10 +23,32 @@ class BaseEnv(PipelineEnv):
         self.physical_joint_range = self.sys.jnt_range[1:]
         self.joint_range = self.physical_joint_range
         self.joint_torque_range = self.sys.actuator_ctrlrange
+        # Termination band selector; see `termination_joint_range` below. False reproduces
+        # the historical behaviour exactly.
+        self.terminate_on_physical_limits = False
 
         # number of everything
         self._nv = self.sys.nv
         self._nq = self.sys.nq
+
+    @property
+    def termination_joint_range(self):
+        """The joint band `done` is judged against.
+
+        Defaults to `joint_range`, which is what the envs have always used -- but note
+        that `joint_range` is also the *action-scaling* band in `act2joint`, and some envs
+        (e.g. UnitreeH1LocoEnv) narrow it well inside the model's physical limits. Using it
+        for termination therefore ends an episode on ordinary tracking error rather than on
+        a fall. Set `terminate_on_physical_limits = True` to judge against the model's real
+        `jnt_range` instead.
+
+        Resolved on every access rather than snapshotted, for two reasons: subclasses
+        reassign `joint_range` *after* `BaseEnv.__init__` returns, and the sim2sim harness
+        rewrites `physical_joint_range` per step when it swaps in a randomized model.
+        """
+        if self.terminate_on_physical_limits:
+            return self.physical_joint_range
+        return self.joint_range
 
     def make_system(self, config: BaseEnvConfig) -> System:
         """

@@ -87,6 +87,10 @@ class DomainRandConfig:
     save_rollouts: bool = False
     # how many of the most divergent paired trials get a full 50 Hz state log written
     n_interesting: int = 12
+    # Judge `done` against the model's real joint limits instead of the env's hand-tuned
+    # action-scaling band. The band is far tighter than physical limits, so leaving this
+    # off ends episodes on ordinary tracking error rather than on a fall.
+    terminate_on_physical_limits: bool = True
     params: Dict[str, Dict[str, Any]] = dc_field(default_factory=dict)
 
 

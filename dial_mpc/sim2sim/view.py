@@ -3,8 +3,9 @@
 Reads the 50 Hz state logs written to `<run>/interesting/` by `dial-mpc-sim2sim-eval`
 and renders them two ways:
 
-  * a side-by-side time-series comparison of the randomized and nominal arms of the same
-    trial (default) -- cheap, no JAX, answers "what went wrong and when";
+  * a side-by-side time-series comparison of the two arms of the same trial -- same
+    theta-perturbed plant and MPC seed, differing only in the planner's model (default);
+    cheap, no JAX, answers "what went wrong and when";
   * a brax 3D playback (`--html`) -- rebuilds pipeline states from the logged qpos/qvel
     so the gait itself can be watched.
 
@@ -12,7 +13,7 @@ Usage:
     dial-mpc-sim2sim-view --run <run_dir>                 # list what was saved
     dial-mpc-sim2sim-view --run <run_dir> --trial 7       # compare both arms of trial 7
     dial-mpc-sim2sim-view --run <run_dir> --trial 7 --html
-    dial-mpc-sim2sim-view --traj <run>/interesting/trial_0007_randomized.npz
+    dial-mpc-sim2sim-view --traj <run>/interesting/trial_0007_nominal_planner.npz
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from dial_mpc.sim2sim.groups import DISPLAY, GROUP_NOMINAL_PLANNER, GROUP_TRUE_PLANNER
 from dial_mpc.sim2sim.analyze import (
     _BASELINE,
     _BLUE,
@@ -71,9 +73,9 @@ def print_index(manifest: Dict[str, Any]) -> None:
     print(f"Config: {manifest['config']}   Metrics: {manifest['trials_csv']}")
     print(f"{len(manifest['entries'])} divergent trial pairs saved at "
           f"{manifest['log_rate_hz']:.0f} Hz\n")
-    print(f"{'trial':>5}  {'d_return':>9}  {'d_steps':>7}  {'rand':>12}  {'nominal':>12}  reasons")
+    print(f"{'trial':>5}  {'d_return':>9}  {'d_steps':>7}  {'nom.planner':>12}  {'true planner':>12}  reasons")
     for e in manifest["entries"]:
-        r, n = e["randomized"], e["nominal"]
+        r, n = e[GROUP_NOMINAL_PLANNER], e[GROUP_TRUE_PLANNER]
         print("%5d  %9.4f  %7d  %5d st %s  %5d st %s  %s" % (
             e["trial"], e["delta_return"], e["delta_steps"],
             r["steps_survived"], "ok  " if r["survived"] else "FELL",
@@ -95,7 +97,7 @@ def _fall_marker(ax, traj: Dict[str, Any], color: str) -> None:
 def fig_compare(trajs: Dict[str, Dict[str, Any]], out_path: str, title: str) -> None:
     """Time series of the quantities that explain a divergence: how high the torso is,
     whether it is tracking the commanded speed, and what the controller is paying."""
-    colors = {"randomized": _ORANGE, "nominal": _BLUE}
+    colors = {GROUP_NOMINAL_PLANNER: _ORANGE, GROUP_TRUE_PLANNER: _BLUE}
 
     fig, axes = plt.subplots(4, 1, figsize=(9, 9), dpi=150, sharex=True)
     fig.patch.set_facecolor(_SURFACE)
@@ -104,15 +106,16 @@ def fig_compare(trajs: Dict[str, Dict[str, Any]], out_path: str, title: str) -> 
         c = colors.get(group, _RED)
         t = np.asarray(traj["time"])
 
+        label = DISPLAY.get(group, group)
         axes[0].plot(t, np.asarray(traj["torso_pos"])[:, 2], color=c, linewidth=2.0,
-                     label=group, zorder=3)
+                     label=label, zorder=3)
         axes[1].plot(t, np.asarray(traj["vel_body"])[:, 0], color=c, linewidth=2.0,
-                     label=group, zorder=3)
+                     label=label, zorder=3)
         axes[2].plot(t, np.asarray(traj["reward"]).reshape(-1), color=c, linewidth=2.0,
-                     label=group, zorder=3)
+                     label=label, zorder=3)
         ctrl = np.asarray(traj["ctrl"])
         axes[3].plot(t, np.sqrt(np.mean(np.square(ctrl), axis=1)), color=c,
-                     linewidth=2.0, label=group, zorder=3)
+                     linewidth=2.0, label=label, zorder=3)
         for ax in axes:
             _fall_marker(ax, traj, c)
 

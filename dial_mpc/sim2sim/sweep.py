@@ -15,7 +15,7 @@ import json
 import os
 import time
 from dataclasses import asdict
-from typing import Any, Dict, List
+from typing import Any, Dict, List, cast
 
 import art
 import jax
@@ -29,7 +29,10 @@ from dial_mpc.core.dial_core import MBDPI
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 
 from dial_mpc.sim2sim.randomize import load_domain_rand_config, resolve_specs, sample_theta, apply_theta
-from dial_mpc.sim2sim.runner import build_envs, PlantStepper, DiffuseStepper, run_trial, TrialResult
+from dial_mpc.sim2sim.groups import GROUP_NOMINAL_PLANNER, GROUP_TRUE_PLANNER, GROUPS
+from dial_mpc.sim2sim.runner import (
+    build_envs, PlantStepper, PlannerStepper, DiffuseStepper, Model, run_trial, TrialResult,
+)
 
 
 def _flatten_theta(theta: Dict[str, np.ndarray]) -> Dict[str, float]:
@@ -51,11 +54,13 @@ def _select_interesting(pairs: List[Dict[str, Any]], n_keep: int) -> List[Dict[s
     Three qualitatively different kinds of divergence, taken together rather than just
     ranking by |delta return|, because they answer different questions:
 
-      * `survival_flip` -- the randomized plant fell and the nominal one did not (or the
-        reverse). The clearest possible domain-shift failure, and invisible in a mean.
-      * `rand_worse` / `rand_better` -- the extreme tails of paired delta return. The
-        `rand_better` side matters: a perturbed plant that beats nominal means the
-        nominal model is not the easiest plant to control, which is worth seeing.
+      * `survival_flip` -- one arm fell and the other did not. Same plant, same seed, so
+        this is purely the planner's model error deciding the episode. The clearest
+        possible domain-shift failure, and invisible in a mean.
+      * `nominal_planner_worse` / `nominal_planner_better` -- the extreme tails of paired
+        delta return. The `better` side matters: the nominal-parameter planner beating the
+        true-parameter planner means model error was not the binding constraint for that
+        draw (sampling noise, or a mismatch that happened to help).
       * `steps_gap` -- largest |delta steps survived|, which catches pairs that both
         eventually fall but at very different times.
     """
@@ -67,15 +72,15 @@ def _select_interesting(pairs: List[Dict[str, Any]], n_keep: int) -> List[Dict[s
             entry["reasons"].append(reason)
 
     for p in pairs:
-        if bool(p["survived_rand"]) != bool(p["survived_nom"]):
+        if bool(p["survived_nominal_planner"]) != bool(p["survived_true_planner"]):
             tag(p, "survival_flip")
 
     by_delta = sorted(pairs, key=lambda p: p["delta_return"])
     per_bucket = max(1, n_keep // 4)
     for p in by_delta[:per_bucket]:
-        tag(p, "rand_worse")
+        tag(p, "nominal_planner_worse")
     for p in [q for q in reversed(by_delta) if q["delta_return"] > 0][:per_bucket]:
-        tag(p, "rand_better")
+        tag(p, "nominal_planner_better")
     for p in sorted(pairs, key=lambda q: -abs(q["delta_steps"]))[:per_bucket]:
         tag(p, "steps_gap")
 
@@ -86,12 +91,23 @@ def _select_interesting(pairs: List[Dict[str, Any]], n_keep: int) -> List[Dict[s
     return [e for e in sorted(tagged.values(), key=priority)][:n_keep]
 
 
+def _cache_size(fn: Any) -> int:
+    """How many times a jitted function has been compiled. `_cache_size` is private API on
+    jax's wrapper, so fall back to -1 ("unknown") rather than crashing a finished sweep."""
+    probe = getattr(fn, "_cache_size", None)
+    try:
+        return int(cast(Any, probe())) if callable(probe) else -1
+    except Exception:
+        return -1
+
+
 def _trial_row(idx: int, seed: int, result: TrialResult) -> Dict[str, Any]:
     row: Dict[str, Any] = {"trial": idx, "seed": seed}
     row.update(_flatten_theta(result.theta))
     d = asdict(result)
     del d["theta"], d["rollout"]
     d["survived"] = int(d["survived"])  # CSV-friendly; bool "True"/"False" isn't numeric
+    d["diverged"] = int(d["diverged"])
     row.update(d)
     return row
 
@@ -123,7 +139,7 @@ def _write_interesting(
         pair = entry["pair"]
         i = pair["trial"]
         files = {}
-        for group in ("randomized", "nominal"):
+        for group in GROUPS:
             log = logs.get(i, {}).get(group)
             if log is None:
                 continue
@@ -144,12 +160,12 @@ def _write_interesting(
             "reasons": entry["reasons"],
             "delta_return": pair["delta_return"],
             "delta_steps": pair["delta_steps"],
-            "randomized": {"return_mean": pair["return_rand"],
-                           "steps_survived": pair["steps_rand"],
-                           "survived": pair["survived_rand"]},
-            "nominal": {"return_mean": pair["return_nom"],
-                        "steps_survived": pair["steps_nom"],
-                        "survived": pair["survived_nom"]},
+            GROUP_NOMINAL_PLANNER: {"return_mean": pair["return_nominal_planner"],
+                                    "steps_survived": pair["steps_nominal_planner"],
+                                    "survived": pair["survived_nominal_planner"]},
+            GROUP_TRUE_PLANNER: {"return_mean": pair["return_true_planner"],
+                                 "steps_survived": pair["steps_true_planner"],
+                                 "survived": pair["survived_true_planner"]},
             "files": files,
             "theta": pair["theta"],
         })
@@ -161,10 +177,14 @@ def _write_interesting(
         "env_name": dial_config.env_name,
         "log_rate_hz": 50.0,
         "note": (
-            "Each trial's two .npz files are the same MPC seed under the randomized and "
-            "the nominal plant. Reproduce a trial by re-running the sweep with the "
-            "config in `config` (same seed and n_trials) -- trial index and seed are "
-            "recorded per entry; `theta` is the realised parameter draw."
+            "Each trial's two .npz files are the SAME theta-perturbed plant driven at the "
+            "SAME MPC seed; they differ only in what the planner was told. "
+            f"'{GROUP_NOMINAL_PLANNER}' planned with the nominal parameters, "
+            f"'{GROUP_TRUE_PLANNER}' planned with the plant's true parameters, so the "
+            "difference between them is the planner's model error alone. `theta` is the "
+            "realised draw and applies to BOTH files. Reproduce by re-running the sweep "
+            "with the config in `config` (same seed and n_trials); trial index and seed "
+            "are recorded per entry."
         ),
         "entries": index,
     }
@@ -205,11 +225,12 @@ def main():
     if args.n_trials is not None:
         drc.n_trials = args.n_trials
 
-    print(f"Building envs for '{dial_config.env_name}' (planner: nominal, plant: randomized)")
+    print(f"Building envs for '{dial_config.env_name}' (plant is theta-perturbed in BOTH arms)")
     planner_env, plant_env = build_envs(dial_config.env_name, env_config)
-    mbdpi = MBDPI(dial_config, planner_env)
+    # Two distinct env objects is a hard requirement: one shared env would have the plant's
+    # swap active while the planner traces.
+    assert planner_env is not plant_env, "planner and plant must be distinct env objects"
     stepper = PlantStepper(plant_env)
-    diffuse = DiffuseStepper(mbdpi, dial_config)
 
     specs = resolve_specs(
         drc.params,
@@ -217,6 +238,26 @@ def main():
         config_arrays={"kp": stepper.nominal_kp, "kd": stepper.nominal_kd},
     )
     print(f"Domain-randomization axes ({len(specs)}): " + ", ".join(s.name for s in specs))
+
+    # Which sys fields theta actually touches -- the planner traces only these and keeps
+    # the other ~337 as constants (see PlannerModel for the measured cost of not doing so).
+    sys_fields = sorted({sp.field for sp in specs if sp.target == "sys"})
+    planner = PlannerStepper(
+        planner_env, stepper.nominal_sys, sys_fields, stepper.nominal_kp, stepper.nominal_kd
+    )
+    # MBDPI must be built with the planner's step fn, and after it.
+    mbdpi = MBDPI(dial_config, planner_env, model_step_fn=planner.step_fn)
+    diffuse = DiffuseStepper(mbdpi, dial_config)
+    assert planner_env.action_size == plant_env.action_size
+
+    if drc.terminate_on_physical_limits:
+        # Both envs, so the planner optimises against the same failure rule the plant is
+        # judged by (`done` feeds reward_alive inside the imagined rollouts too).
+        planner_env.terminate_on_physical_limits = True
+        plant_env.terminate_on_physical_limits = True
+        print("Termination: physical joint limits (not the narrower action-scaling band)")
+    else:
+        print("Termination: env default (the hand-tuned action-scaling band)")
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join(dial_config.output_dir, f"{timestamp}")
@@ -238,32 +279,45 @@ def main():
             theta = sample_theta(theta_rng, specs)
             sys, kp, kd = apply_theta(stepper.nominal_sys, stepper.nominal_kp, stepper.nominal_kd, theta, specs)
 
+            plant_model = Model(sys, kp, kd)
+            if i == 0:
+                # Both arms must share one compiled kernel, or they are not comparable.
+                assert jax.tree_util.tree_structure(planner.nominal) == jax.tree_util.tree_structure(
+                    planner.model_from(sys, kp, kd)
+                ), "planner model treedef differs between arms -> two compilations"
+
+            # Arm A: the planner believes the nominal parameters. This is the domain shift.
             result = run_trial(
-                dial_config, mbdpi, stepper, diffuse, sys, kp, kd, theta, run_rng,
+                dial_config, mbdpi, stepper, diffuse,
+                plant_model, planner.nominal, theta, run_rng,
             )
             row = _trial_row(i, trial_seed, result)
-            row["group"] = "randomized"
+            row["group"] = GROUP_NOMINAL_PLANNER
             rows.append(row)
 
             if result.rollout is not None:
-                logs.setdefault(i, {})["randomized"] = result.rollout
+                logs.setdefault(i, {})[GROUP_NOMINAL_PLANNER] = result.rollout
             if drc.save_rollouts and result.rollout is not None:
-                np.savez(os.path.join(run_dir, "rollouts", f"trial_{i:04d}_randomized.npz"), **result.rollout)
+                np.savez(os.path.join(run_dir, "rollouts",
+                                      f"trial_{i:04d}_{GROUP_NOMINAL_PLANNER}.npz"), **result.rollout)
 
             if drc.paired:
+                # Arm B: identical plant, identical MPC seed -- the planner is simply told
+                # the truth. The difference between the arms is the planner's model error
+                # and nothing else.
                 nominal_result = run_trial(
                     dial_config, mbdpi, stepper, diffuse,
-                    stepper.nominal_sys, stepper.nominal_kp, stepper.nominal_kd,
-                    theta, run_rng,
+                    plant_model, planner.model_from(sys, kp, kd), theta, run_rng,
                 )
                 nrow = _trial_row(i, trial_seed, nominal_result)
-                nrow["group"] = "nominal"
+                nrow["group"] = GROUP_TRUE_PLANNER
                 rows.append(nrow)
                 if nominal_result.rollout is not None:
-                    logs.setdefault(i, {})["nominal"] = nominal_result.rollout
+                    logs.setdefault(i, {})[GROUP_TRUE_PLANNER] = nominal_result.rollout
                 if drc.save_rollouts and nominal_result.rollout is not None:
                     np.savez(
-                        os.path.join(run_dir, "rollouts", f"trial_{i:04d}_nominal.npz"),
+                        os.path.join(run_dir, "rollouts",
+                                     f"trial_{i:04d}_{GROUP_TRUE_PLANNER}.npz"),
                         **nominal_result.rollout,
                     )
                 delta = result.return_mean - nominal_result.return_mean
@@ -272,12 +326,12 @@ def main():
                     "seed": trial_seed,
                     "delta_return": delta,
                     "delta_steps": result.steps_survived - nominal_result.steps_survived,
-                    "survived_rand": result.survived,
-                    "survived_nom": nominal_result.survived,
-                    "return_rand": result.return_mean,
-                    "return_nom": nominal_result.return_mean,
-                    "steps_rand": result.steps_survived,
-                    "steps_nom": nominal_result.steps_survived,
+                    "survived_nominal_planner": result.survived,
+                    "survived_true_planner": nominal_result.survived,
+                    "return_nominal_planner": result.return_mean,
+                    "return_true_planner": nominal_result.return_mean,
+                    "steps_nominal_planner": result.steps_survived,
+                    "steps_true_planner": nominal_result.steps_survived,
                     "theta": {k: np.asarray(v).tolist() for k, v in theta.items()},
                 })
                 pbar.set_postfix({"ret": f"{result.return_mean:.2e}", "d_ret": f"{delta:.2e}"})
@@ -292,24 +346,50 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    rand_rows = [r for r in rows if r["group"] == "randomized"]
+    rand_rows = [r for r in rows if r["group"] == GROUP_NOMINAL_PLANNER]
     summary = {
         "n_trials": drc.n_trials,
         "paired": drc.paired,
         "env_name": dial_config.env_name,
         "n_steps": dial_config.n_steps,
-        "return_mean": float(np.mean([r["return_mean"] for r in rand_rows])),
-        "return_std": float(np.std([r["return_mean"] for r in rand_rows])),
+        "return_mean": float(np.nanmean([r["return_mean"] for r in rand_rows])),
+        "return_std": float(np.nanstd([r["return_mean"] for r in rand_rows])),
         "survival_rate": float(np.mean([r["survived"] for r in rand_rows])),
-        "optimism_gap_mean": float(np.mean([r["optimism_gap"] for r in rand_rows])),
+        "diverged_trials": int(sum(r["diverged"] for r in rows)),
+        "planner_frac_diverged_mean": float(np.nanmean([r["frac_diverged"] for r in rows])),
+        "optimism_gap_mean": float(np.nanmean([r["optimism_gap"] for r in rand_rows])),
         "pred_err_1step_mean": float(np.nanmean([r["pred_err_1step"] for r in rand_rows])),
     }
     if drc.paired:
-        nom_rows = [r for r in rows if r["group"] == "nominal"]
-        deltas = [rr["return_mean"] - nr["return_mean"] for rr, nr in zip(rand_rows, nom_rows)]
-        summary["nominal_return_mean"] = float(np.mean([r["return_mean"] for r in nom_rows]))
-        summary["paired_delta_return_mean"] = float(np.mean(deltas))
-        summary["paired_delta_return_std"] = float(np.std(deltas))
+        nom_rows = [r for r in rows if r["group"] == GROUP_TRUE_PLANNER]
+        deltas = np.array(
+            [rr["return_mean"] - nr["return_mean"] for rr, nr in zip(rand_rows, nom_rows)],
+            dtype=float,
+        )
+        summary["true_planner_return_mean"] = float(np.nanmean([r["return_mean"] for r in nom_rows]))
+        summary["paired_delta_return_mean"] = float(np.nanmean(deltas))
+        summary["paired_delta_return_std"] = float(np.nanstd(deltas))
+        summary["paired_trials_usable"] = int(np.isfinite(deltas).sum())
+    # Compile guards: these are fixed costs that must NOT grow with the number of trials.
+    # If a parameter draw forced a retrace, runtime would collapse and -- worse -- the two
+    # arms could end up running different compiled code, making them incomparable.
+    # `plant_step` is 2 rather than 1 for a benign reason that predates this harness: the
+    # very first step of an episode is applied to `Y0[0]` sliced from a freshly-allocated
+    # zeros array, and later steps to `Y0[0]` coming out of the diffusion, which have
+    # different avals. Verified stable at 2 across 16+ trial pairs.
+    caches = {
+        "diffuse_init": _cache_size(diffuse.diffuse_init_jit),
+        "diffuse": _cache_size(diffuse.diffuse_jit),
+        "plant_step": _cache_size(stepper.step_jit),
+        "plant_reset": _cache_size(stepper.reset_jit),
+    }
+    expected = {"diffuse_init": 1, "diffuse": 1, "plant_step": 2, "plant_reset": 1}
+    summary["jit_cache_sizes"] = caches
+    over = {k: v for k, v in caches.items() if v > expected[k]}
+    if over:
+        print(f"\n*** WARNING: more compilations than expected {over}; "
+              f"expected {expected}. Something retraced per-trial. ***\n")
+
     with open(os.path.join(run_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2)
 

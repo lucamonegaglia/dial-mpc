@@ -23,7 +23,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Mapping, Optional, Tuple, cast
+from typing import Any, Callable, ContextManager, Dict, List, Mapping, NamedTuple, Optional, Sequence, Tuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -43,11 +43,89 @@ from dial_mpc.utils.function_utils import global_to_body_velocity
 # Signatures of the jitted closures below. `jax.jit` returns an opaque `Wrapped` whose
 # return type is Any, which silently erases `State` at every call site; naming the
 # signatures here is what lets a type checker follow `state` through the rollout loop.
-StepFn = Callable[[System, jax.Array, jax.Array, State, jax.Array], State]
-ResetFn = Callable[[System, jax.Array, jax.Array, jax.Array], State]
+class Model(NamedTuple):
+    """A complete set of dynamics parameters: the MJX model plus the controller gains.
+
+    A NamedTuple is a pytree, so a `Model` can be passed straight through `jax.jit` as a
+    traced argument. Keeping the three together in one node (rather than three loose
+    arguments) means the plant model and the planner model are structurally identical by
+    construction, which is what lets both experiment arms share a single compilation.
+    """
+
+    sys: System
+    kp: jax.Array
+    kd: jax.Array
+
+
+class PlannerModel(NamedTuple):
+    """What the planner is told about the plant.
+
+    Deliberately *not* a full `Model`. Passing an entire `System` as a traced argument
+    costs a measured **1.61x** in steady-state MPC time, because XLA can no longer
+    constant-fold the mass/inertia arrays into the 2048-sample MJX kernel. Only 5 of the
+    System's 342 fields are ever randomized, so this carries just those, in a fixed field
+    order, and the planner reconstructs the System inside the trace from a constant
+    nominal. Measured cost of that version: **1.015x**. See `PlannerStepper`.
+
+    `values` holds the randomized `sys` fields in `PlannerStepper.fields` order; the field
+    *names* stay a Python constant on the stepper and must never enter this pytree.
+    """
+
+    values: Tuple[jax.Array, ...]
+    kp: jax.Array
+    kd: jax.Array
+
+
+StepFn = Callable[[Model, State, jax.Array], State]
+ResetFn = Callable[[Model, jax.Array], State]
+PlannerStepFn = Callable[[PlannerModel, State, jax.Array], State]
 DiffuseFn = Callable[
-    [jax.Array, jax.Array, State], Tuple[jax.Array, jax.Array, Dict[str, jax.Array]]
+    [PlannerModel, jax.Array, jax.Array, State],
+    Tuple[jax.Array, jax.Array, Dict[str, jax.Array]],
 ]
+
+
+def make_model_swap(env: BaseEnv) -> Callable[..., ContextManager[BaseEnv]]:
+    """Build a contextmanager that temporarily installs a `Model` onto `env`.
+
+    Entered *during tracing*, so `sys`/`kp`/`kd` become traced inputs of the enclosing jit
+    rather than closure constants -- the whole reason the harness compiles once instead of
+    once per parameter draw. Shared by the plant and the planner so the two can never
+    drift apart.
+    """
+    # If joint_range was never overridden by the env subclass (i.e. it's just an alias for
+    # physical_joint_range, as set in BaseEnv.__init__), it's safe to keep it in sync with
+    # a randomized jnt_range. Envs that hand-tune joint_range to a different (usually
+    # tighter) band -- e.g. UnitreeH1LocoEnv -- must NOT have it overwritten.
+    refresh_joint_range = bool(
+        np.array_equal(np.asarray(env.joint_range), np.asarray(env.physical_joint_range))
+    )
+
+    @contextlib.contextmanager
+    def _swap(sys: System, kp: jax.Array, kd: jax.Array):
+        o_sys = env.sys
+        o_cfg = env._config
+        o_pjr = env.physical_joint_range
+        o_jr = env.joint_range
+        o_jtr = env.joint_torque_range
+        try:
+            env.sys = sys
+            env._config = dataclasses.replace(o_cfg, kp=kp, kd=kd)
+            # BaseEnv.__init__ snapshots these three from sys at construction time
+            # (base_env.py:23-25); if the randomized fields feed them, refresh so
+            # act2joint/act2tau/termination see the randomized model, not the nominal
+            # one baked in at __init__.
+            env.physical_joint_range = sys.jnt_range[1:]
+            env.joint_torque_range = sys.actuator_ctrlrange
+            if refresh_joint_range:
+                env.joint_range = sys.jnt_range[1:]
+            yield env
+        finally:
+            env.sys, env._config = o_sys, o_cfg
+            env.physical_joint_range, env.joint_range = o_pjr, o_jr
+            env.joint_torque_range = o_jtr
+
+    return _swap
 
 
 def build_envs(env_name: str, env_config: BaseEnvConfig) -> Tuple[BaseEnv, BaseEnv]:
@@ -70,9 +148,7 @@ class PlantStepper:
     """
 
     plant_env: BaseEnv
-    nominal_sys: System
-    nominal_kp: jax.Array
-    nominal_kd: jax.Array
+    nominal: Model
     torso_idx: int
     step_jit: StepFn
     reset_jit: ResetFn
@@ -80,10 +156,9 @@ class PlantStepper:
     def __init__(self, plant_env: BaseEnv):
         env = plant_env
         self.plant_env = env
-        self.nominal_sys = env.sys
-        self.nominal_kp = jnp.asarray(env._config.kp)
-        self.nominal_kd = jnp.asarray(env._config.kd)
-        self._nominal_config = env._config
+        self.nominal = Model(
+            env.sys, jnp.asarray(env._config.kp), jnp.asarray(env._config.kd)
+        )
 
         # `_torso_idx` is set by the concrete env subclass, not by BaseEnv, so resolve it
         # once here with a clear failure instead of reaching through `env` at every
@@ -96,44 +171,10 @@ class PlantStepper:
             )
         self.torso_idx = int(torso_idx)
 
-        # If joint_range was never overridden by the env subclass (i.e. it's just an
-        # alias for physical_joint_range, as set in BaseEnv.__init__), it's safe to
-        # keep it in sync with a randomized jnt_range. Envs that hand-tune joint_range
-        # to a different (usually tighter) safety band -- e.g. UnitreeH1LocoEnv -- must
-        # NOT have it overwritten by a physical-range refresh.
-        self._refresh_joint_range = bool(
-            np.array_equal(np.asarray(env.joint_range), np.asarray(env.physical_joint_range))
-        )
+        self._swap = make_model_swap(env)
 
-        @contextlib.contextmanager
-        def _swap(sys: System, kp: jax.Array, kd: jax.Array):
-            o_sys = env.sys
-            o_cfg = env._config
-            o_pjr = env.physical_joint_range
-            o_jr = env.joint_range
-            o_jtr = env.joint_torque_range
-            try:
-                env.sys = sys
-                env._config = dataclasses.replace(o_cfg, kp=kp, kd=kd)
-                # BaseEnv.__init__ snapshots these three from sys at construction time
-                # (base_env.py:23-25); if the randomized fields feed them, refresh so
-                # act2joint/act2tau/termination see the randomized model, not the
-                # nominal one baked in at __init__.
-                env.physical_joint_range = sys.jnt_range[1:]
-                env.joint_torque_range = sys.actuator_ctrlrange
-                if self._refresh_joint_range:
-                    env.joint_range = sys.jnt_range[1:]
-                yield env
-            finally:
-                env.sys, env._config = o_sys, o_cfg
-                env.physical_joint_range, env.joint_range = o_pjr, o_jr
-                env.joint_torque_range = o_jtr
-
-        self._swap = _swap
-
-        def _step(sys: System, kp: jax.Array, kd: jax.Array, state: State,
-                  action: jax.Array) -> State:
-            with self._swap(sys, kp, kd) as e:
+        def _step(model: Model, state: State, action: jax.Array) -> State:
+            with self._swap(*model) as e:
                 return e.step(state, action)
 
         # reset() calls pipeline_init(), which reads self.sys at *trace* time. Jitting
@@ -142,12 +183,80 @@ class PlantStepper:
         # planner's model rather than the plant's -- the one place domain shift could
         # silently leak out of the plant. Route it through the same swap as step, which
         # also keeps it at a single trace across all parameter draws.
-        def _reset(sys: System, kp: jax.Array, kd: jax.Array, rng: jax.Array) -> State:
-            with self._swap(sys, kp, kd) as e:
+        def _reset(model: Model, rng: jax.Array) -> State:
+            with self._swap(*model) as e:
                 return e.reset(rng)
 
         self.step_jit = cast(StepFn, jax.jit(_step))
         self.reset_jit = cast(ResetFn, jax.jit(_reset))
+
+    # Back-compat aliases; `resolve_specs` and the sweep still speak in loose arrays.
+    @property
+    def nominal_sys(self) -> System:
+        return self.nominal.sys
+
+    @property
+    def nominal_kp(self) -> jax.Array:
+        return self.nominal.kp
+
+    @property
+    def nominal_kd(self) -> jax.Array:
+        return self.nominal.kd
+
+
+class PlannerStepper:
+    """The planner-side twin of `PlantStepper`.
+
+    Exposes `step_fn(model, state, action)` whose dynamics parameters are traced
+    arguments, so `MBDPI` can roll out its 2048-sample imagination under an arbitrary
+    parameter set without rebuilding anything. That is what makes "what if the planner
+    knew the true parameters?" a per-trial *argument* rather than a per-trial recompile.
+
+    Only the randomized fields travel as tracers; everything else in the System is closed
+    over as a Python constant so XLA can still fold it into the kernel. Measured at
+    Ndiffuse=1 on an RTX 4090, median over 10 distinct draws:
+
+        baked-in constant model (today's MBDPI)   11.57 ms   1.000x
+        full System passed as a traced argument   18.58 ms   1.606x
+        this class (5 randomized fields traced)   11.75 ms   1.015x
+
+    `nominal_sys` must be the **plant's** System object, not `planner_env.sys`. The two
+    envs are built separately and therefore hold distinct `mj_model` objects, and
+    `mj_model` is a *static* pytree field -- so models built from different envs have
+    different treedefs and would compile twice, one per experiment arm, silently making
+    the arms incomparable.
+
+    There is deliberately no `reset` (the planner always starts from the plant's current
+    pipeline_state), and `step_fn` is deliberately not jitted: it is only ever called
+    inside `DiffuseStepper`'s jit, where it is traced once as part of the scan body.
+    """
+
+    planner_env: BaseEnv
+    fields: Tuple[str, ...]
+    nominal: PlannerModel
+    step_fn: PlannerStepFn
+
+    def __init__(self, planner_env: BaseEnv, nominal_sys: System,
+                 fields: Sequence[str], nominal_kp: jax.Array, nominal_kd: jax.Array):
+        env = planner_env
+        self.planner_env = env
+        self.fields = tuple(fields)
+        self._nominal_sys = nominal_sys
+        self.nominal = self.model_from(nominal_sys, nominal_kp, nominal_kd)
+        self._swap = make_model_swap(env)
+
+        def step(model: PlannerModel, state: State, action: jax.Array) -> State:
+            sys = self._nominal_sys.tree_replace(dict(zip(self.fields, model.values)))
+            with self._swap(sys, model.kp, model.kd) as e:
+                return e.step(state, action)
+
+        self.step_fn = step
+
+    def model_from(self, sys: System, kp: jax.Array, kd: jax.Array) -> PlannerModel:
+        """Project a full `Model`/System down to just the randomized fields."""
+        return PlannerModel(
+            tuple(cast(jax.Array, getattr(sys, f)) for f in self.fields), kp, kd
+        )
 
 
 class DiffuseStepper:
@@ -174,15 +283,21 @@ class DiffuseStepper:
         self.mbdpi = mbdpi
         self.dial_config = dial_config
 
-        def reverse_scan(carry, factor):
-            rng_, Y0_, state_ = carry
-            rng_, Y0_, info_ = mbdpi.reverse_once(state_, rng_, Y0_, factor)
-            return (rng_, Y0_, state_), info_
-
         def make_diffuse(n_diffuse: int) -> DiffuseFn:
             factors = mbdpi.sigma_control * dial_config.traj_diffuse_factor ** (jnp.arange(n_diffuse))[:, None]
 
-            def diffuse(rng: jax.Array, Y0: jax.Array, state: State):
+            def diffuse(model: PlannerModel, rng: jax.Array, Y0: jax.Array, state: State):
+                # `reverse_scan` lives in here so it can close over `model`. That closure
+                # is rebuilt per call, but harmlessly: the jit cache is keyed on `diffuse`,
+                # which is created exactly once below. (Rebuilding a scan body per call
+                # only causes retracing when the scan runs *outside* a jit -- the failure
+                # this class was written to prevent.) Passing the model through the closure
+                # rather than the scan carry also keeps ~300 model leaves out of the carry.
+                def reverse_scan(carry, factor):
+                    rng_, Y0_, state_ = carry
+                    rng_, Y0_, info_ = mbdpi.reverse_once(state_, rng_, Y0_, factor, model)
+                    return (rng_, Y0_, state_), info_
+
                 (rng, Y0, _), info = jax.lax.scan(reverse_scan, (rng, Y0, state), factors)
                 return rng, Y0, info
 
@@ -199,6 +314,13 @@ class TrialResult:
     return_mean: float
     steps_survived: int
     survived: bool
+    # True if the rollout produced a non-finite reward/state. Tracked separately from
+    # `survived` because a NaN reward makes `done` NaN too, and `bool(nan > 0.5)` is
+    # False -- so a diverged trial would otherwise be recorded as a perfect episode.
+    diverged: bool
+    # Mean fraction of the planner's sampled rollouts that diverged, per MPC step. Small
+    # nonzero values are normal and harmless (those samples are simply rejected).
+    frac_diverged: float
     plan_return_mean: float
     optimism_gap: float
     pred_err_1step: float
@@ -236,18 +358,23 @@ def run_trial(
     mbdpi: MBDPI,
     stepper: PlantStepper,
     diffuse: DiffuseStepper,
-    sys: System,
-    kp: jax.Array,
-    kd: jax.Array,
+    plant_model: Model,
+    planner_model: PlannerModel,
     theta: Mapping[str, jax.Array],
     rng: jax.Array,
 ) -> TrialResult:
-    """Run one closed-loop trial: nominal planner (inside `mbdpi`), plant driven by
-    `(sys, kp, kd)`. Mirrors `dial_core.main()`'s loop (apply -> shift -> replan), plus
-    termination handling and domain-shift metrics that the original lacks.
+    """Run one closed-loop trial of `plant_model`, controlled by MPC that plans with
+    `planner_model`.
 
-    `diffuse` must be built once (outside any per-trial loop) and reused across trials --
-    see `DiffuseStepper`'s docstring for why that matters for performance.
+    The two arms of the experiment differ *only* in `planner_model`: pass the nominal
+    parameters for the mismatched arm, or `plant_model` itself for the matched arm in
+    which the planner is told the plant's true parameters. Both models have identical
+    pytree structure, so both arms hit the same compiled code.
+
+    Mirrors `dial_core.main()`'s loop (apply -> shift -> replan), plus termination handling
+    and domain-shift metrics that the original lacks. `diffuse` must be built once (outside
+    any per-trial loop) and reused across trials -- see `DiffuseStepper`'s docstring for why
+    that matters for performance.
     """
     n_steps = dial_config.n_steps
 
@@ -263,7 +390,7 @@ def run_trial(
         return cast(PipelineState, ps)
 
     rng, rng_reset = jax.random.split(rng)
-    state: State = stepper.reset_jit(sys, kp, kd, rng_reset)
+    state: State = stepper.reset_jit(plant_model, rng_reset)
     Y0 = jnp.zeros([dial_config.Hnode + 1, mbdpi.nu])
 
     return_sum = 0.0
@@ -274,6 +401,8 @@ def run_trial(
     torque_sq_sum = 0.0
     steps_survived = n_steps
     survived = True
+    diverged = False
+    frac_div: List[float] = []
     prev_xbar1: Optional[jax.Array] = None
 
     # Recorded every control step (env.dt = 0.02 s -> 50 Hz for the H1 configs), which
@@ -287,10 +416,17 @@ def run_trial(
 
     for t in range(n_steps):
         action = Y0[0]
-        state = stepper.step_jit(sys, kp, kd, state, action)
+        state = stepper.step_jit(plant_model, state, action)
 
         ps = pipeline_of(state)
         r = float(state.reward)
+        if not np.isfinite(r):
+            # The plant received a non-finite action, or integrated to a non-finite state.
+            # Stop here and record it as a divergence rather than a survival.
+            diverged = True
+            steps_survived = t
+            survived = False
+            break
         return_sum += r
         torque_sq_sum += float(jnp.sum(jnp.square(ps.ctrl)))
 
@@ -321,16 +457,23 @@ def run_trial(
 
         Y0 = mbdpi.shift(Y0)
         diffuse_fn = diffuse.diffuse_init_jit if t == 0 else diffuse.diffuse_jit
-        rng, Y0, info = diffuse_fn(rng, Y0, state)
+        rng, Y0, info = diffuse_fn(planner_model, rng, Y0, state)
         plan_returns.append(float(info["rews"][-1].mean()))
+        if "frac_diverged" in info:
+            frac_div.append(float(np.asarray(info["frac_diverged"]).mean()))
         # xbar[-1] is the last diffusion iterate's weighted-mean predicted trajectory,
-        # under the (nominal) PLANNER model, starting from the state just reached above.
-        # xbar[-1][1] is its 1-step-ahead prediction -- compared against the plant's
-        # actual next state at the top of the following iteration.
+        # under whichever PLANNER model this trial was given, starting from the state just
+        # reached above. xbar[-1][1] is its 1-step-ahead prediction -- compared against the
+        # plant's actual next state at the top of the following iteration. When the planner
+        # has the true parameters this should be near zero (not exactly zero: xbar is a
+        # weighted mean over the sample set, not a rollout of the applied Y0[0]), which is
+        # the sharpest end-to-end evidence that the planner really sees theta.
         prev_xbar1 = info["xbar"][-1][1]
 
     plan_return_mean = float(np.mean(plan_returns)) if plan_returns else 0.0
     return_mean = return_sum / steps_survived if steps_survived > 0 else 0.0
+    if diverged and steps_survived == 0:
+        return_mean = float("nan")
 
     rollout: Dict[str, np.ndarray] = {k: np.stack(v) for k, v in log.items() if v}
     rollout["time"] = np.arange(len(log["reward"]), dtype=np.float64) * float(stepper.plant_env.dt)
@@ -341,6 +484,8 @@ def run_trial(
         return_mean=return_mean,
         steps_survived=steps_survived,
         survived=survived,
+        diverged=diverged,
+        frac_diverged=float(np.mean(frac_div)) if frac_div else 0.0,
         plan_return_mean=plan_return_mean,
         optimism_gap=plan_return_mean - return_mean,
         pred_err_1step=float(np.mean(pred_errs)) if pred_errs else float("nan"),

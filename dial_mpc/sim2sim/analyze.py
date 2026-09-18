@@ -22,6 +22,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from dial_mpc.sim2sim.groups import (
+    DISPLAY, GROUPS, GROUP_NOMINAL_PLANNER, GROUP_TRUE_PLANNER,
+    LEGACY_GROUPS, LEGACY_WARNING,
+)
+
 # Validated default palette (dial_mpc.sim2sim.analyze does not touch brand color --
 # these are the skill's pre-validated reference values, used as-is).
 _SURFACE = "#fcfcfb"
@@ -53,6 +58,7 @@ def _style_axes(ax):
 def load_trials(run_dir: str) -> List[Dict]:
     path = os.path.join(run_dir, "trials.csv")
     rows = []
+    legacy = [False]
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
         for r in reader:
@@ -62,13 +68,17 @@ def load_trials(run_dir: str) -> List[Dict]:
                     parsed[k] = None
                     continue
                 if k in ("group",):
-                    parsed[k] = v
+                    parsed[k] = LEGACY_GROUPS.get(v, v)
+                    if v in LEGACY_GROUPS:
+                        legacy[0] = True
                 else:
                     try:
                         parsed[k] = float(v)
                     except ValueError:
                         parsed[k] = v
             rows.append(parsed)
+    if legacy[0]:
+        print("WARNING: " + LEGACY_WARNING + "\n")
     return rows
 
 
@@ -86,7 +96,8 @@ def _theta_columns(rows: List[Dict]) -> List[str]:
 def fig_return_ecdf(rows: List[Dict], out_path: str):
     fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
     fig.patch.set_facecolor(_SURFACE)
-    for group, color, label in (("randomized", _BLUE, "Randomized plant"), ("nominal", _ORANGE, "Nominal plant")):
+    for group, color, label in ((GROUP_NOMINAL_PLANNER, _BLUE, DISPLAY[GROUP_NOMINAL_PLANNER]),
+                                (GROUP_TRUE_PLANNER, _ORANGE, DISPLAY[GROUP_TRUE_PLANNER])):
         vals = sorted(r["return_mean"] for r in rows if r["group"] == group)
         if not vals:
             continue
@@ -109,9 +120,9 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
     for r in rows:
         by_trial.setdefault(int(r["trial"]), {})[r["group"]] = r
     deltas = [
-        d["randomized"]["return_mean"] - d["nominal"]["return_mean"]
+        d[GROUP_NOMINAL_PLANNER]["return_mean"] - d[GROUP_TRUE_PLANNER]["return_mean"]
         for d in by_trial.values()
-        if "randomized" in d and "nominal" in d
+        if GROUP_NOMINAL_PLANNER in d and GROUP_TRUE_PLANNER in d
     ]
     if not deltas:
         return
@@ -126,9 +137,9 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
         patch.set_linewidth(1.0)
     ax.axvline(0.0, color=_INK_MUTED, linewidth=1.2, linestyle=(0, (3, 2)), zorder=3)
     _style_axes(ax)
-    ax.set_xlabel("Δ mean reward  (randomized − nominal, same seed)")
+    ax.set_xlabel("Δ mean reward   (nominal-parameter − true-parameter planner, same plant & seed)")
     ax.set_ylabel("Trial count")
-    ax.set_title("Paired domain-shift effect on return", color=_INK, fontsize=11, loc="left")
+    ax.set_title("Cost of planning with the wrong model", color=_INK, fontsize=11, loc="left")
     fig.tight_layout()
     fig.savefig(out_path, facecolor=_SURFACE)
     plt.close(fig)
@@ -137,9 +148,9 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
 def fig_survival(rows: List[Dict], out_path: str):
     fig, ax = plt.subplots(figsize=(4.5, 4), dpi=150)
     fig.patch.set_facecolor(_SURFACE)
-    groups = [g for g in ("randomized", "nominal") if any(r["group"] == g for r in rows)]
-    colors = {"randomized": _BLUE, "nominal": _ORANGE}
-    labels = {"randomized": "Randomized", "nominal": "Nominal"}
+    groups = [g for g in GROUPS if any(r["group"] == g for r in rows)]
+    colors = {GROUP_NOMINAL_PLANNER: _BLUE, GROUP_TRUE_PLANNER: _ORANGE}
+    labels = {g: DISPLAY[g] for g in GROUPS}
     rates = [np.mean([r["survived"] for r in rows if r["group"] == g]) for g in groups]
     bars = ax.bar(
         [labels[g] for g in groups], rates,
@@ -164,11 +175,11 @@ def fig_sensitivity(rows: List[Dict], out_path: str):
     by_trial = {}
     for r in rows:
         by_trial.setdefault(int(r["trial"]), {})[r["group"]] = r
-    paired = [d for d in by_trial.values() if "randomized" in d and "nominal" in d]
+    paired = [d for d in by_trial.values() if GROUP_NOMINAL_PLANNER in d and GROUP_TRUE_PLANNER in d]
     if not paired:
         return
     theta_cols = _theta_columns(rows)
-    theta_cols = [c for c in theta_cols if all(d["randomized"].get(c) is not None for d in paired)]
+    theta_cols = [c for c in theta_cols if all(d[GROUP_NOMINAL_PLANNER].get(c) is not None for d in paired)]
     if not theta_cols:
         return
 
@@ -187,8 +198,8 @@ def fig_sensitivity(rows: List[Dict], out_path: str):
 
     for i, col in enumerate(theta_cols):
         ax = axes[i // ncols][i % ncols]
-        x = np.array([d["randomized"][col] for d in paired])
-        y = np.array([d["randomized"]["return_mean"] - d["nominal"]["return_mean"] for d in paired])
+        x = np.array([d[GROUP_NOMINAL_PLANNER][col] for d in paired])
+        y = np.array([d[GROUP_NOMINAL_PLANNER]["return_mean"] - d[GROUP_TRUE_PLANNER]["return_mean"] for d in paired])
         ax.scatter(x, y, s=14, color=_BLUE, alpha=0.75, edgecolors="none", zorder=2)
         ax.axhline(0.0, color=_INK_MUTED, linewidth=1.0, linestyle=(0, (3, 2)), zorder=1)
         rho = spearman(x, y)
@@ -200,7 +211,7 @@ def fig_sensitivity(rows: List[Dict], out_path: str):
     for j in range(n, nrows * ncols):
         axes[j // ncols][j % ncols].axis("off")
 
-    fig.suptitle("Per-parameter sensitivity of domain shift", color=_INK, fontsize=12, x=0.02, ha="left")
+    fig.suptitle("Per-parameter sensitivity of planner model error", color=_INK, fontsize=12, x=0.02, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.96))
     fig.savefig(out_path, facecolor=_SURFACE)
     plt.close(fig)
@@ -287,22 +298,22 @@ def fig_sensitivity_summary(rows: List[Dict], out_path: str, csv_path: str):
     by_trial: Dict[int, Dict[str, Dict]] = {}
     for r in rows:
         by_trial.setdefault(int(r["trial"]), {})[cast(str, r["group"])] = r
-    paired = [d for d in by_trial.values() if "randomized" in d and "nominal" in d]
+    paired = [d for d in by_trial.values() if GROUP_NOMINAL_PLANNER in d and GROUP_TRUE_PLANNER in d]
     if len(paired) < 8:
         return
 
     theta_cols = _theta_columns(rows)
     groups = _spec_groups([c for c in theta_cols
-                           if all(d["randomized"].get(c) is not None for d in paired)])
+                           if all(d[GROUP_NOMINAL_PLANNER].get(c) is not None for d in paired)])
     if not groups:
         return
 
-    d_ret = np.array([d["randomized"]["return_mean"] - d["nominal"]["return_mean"] for d in paired])
-    d_steps = np.array([d["randomized"]["steps_survived"] - d["nominal"]["steps_survived"] for d in paired])
+    d_ret = np.array([d[GROUP_NOMINAL_PLANNER]["return_mean"] - d[GROUP_TRUE_PLANNER]["return_mean"] for d in paired])
+    d_steps = np.array([d[GROUP_NOMINAL_PLANNER]["steps_survived"] - d[GROUP_TRUE_PLANNER]["steps_survived"] for d in paired])
 
     stats: Dict[str, Dict[str, Dict[str, float]]] = {}
     for name, cols in groups.items():
-        x = np.array([_group_value(d["randomized"], cols) for d in paired])
+        x = np.array([_group_value(d[GROUP_NOMINAL_PLANNER], cols) for d in paired])
         stats[name] = {
             "return": _standardized_effect(x, d_ret),
             "steps": _standardized_effect(x, d_steps),
@@ -331,10 +342,10 @@ def fig_sensitivity_summary(rows: List[Dict], out_path: str, csv_path: str):
         ax.set_yticklabels(order, fontsize=9)
         ax.set_xlabel(f"{label}   per 1 SD of parameter", fontsize=9)
 
-    fig.suptitle("Which model parameters drive the domain-shift penalty?",
+    fig.suptitle("Which model errors hurt the planner most?",
                  color=_INK, fontsize=12.5, x=0.010, y=0.985, ha="left")
     fig.text(0.010, 0.945,
-             "Paired randomized − nominal, same MPC seed.  Bars: OLS effect per 1 SD of the "
+             "Same plant and MPC seed in both arms; only the planner's model differs.  Bars: OLS effect per 1 SD of the "
              "sampled range.  Lines: bootstrap 95% CI — crossing 0 means no detected effect.",
              fontsize=8.5, color=_INK_SECONDARY, ha="left", va="top")
     fig.tight_layout(rect=(0, 0, 1, 0.915))
@@ -376,7 +387,7 @@ def main():
         )
     fig_survival(rows, os.path.join(fig_dir, "survival.png"))
 
-    rand_rows = [r for r in rows if r["group"] == "randomized"]
+    rand_rows = [r for r in rows if r["group"] == GROUP_NOMINAL_PLANNER]
     summary_path = os.path.join(args.run, "summary.json")
     if os.path.exists(summary_path):
         with open(summary_path) as f:

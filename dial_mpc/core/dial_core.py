@@ -42,6 +42,25 @@ def rollout_us(step_env, state, us):
     return rews, pipline_states
 
 
+def rollout_us_model(step_env_model, model, state, us):
+    """Like `rollout_us`, but the physics model is a *traced argument* rather than a
+    Python closure constant.
+
+    `step_env_model(model, state, u)` receives `model` -- an opaque pytree, whose contents
+    are the caller's business -- so the planner can be rolled out under an arbitrary set of
+    dynamics parameters without rebuilding (and therefore recompiling) anything. Used by
+    the sim2sim harness to give the planner the plant's true parameters; `rollout_us` above
+    is untouched and remains the path every existing caller takes.
+    """
+
+    def step(state, u):
+        state = step_env_model(model, state, u)
+        return state, (state.reward, state.pipeline_state)
+
+    _, (rews, pipline_states) = jax.lax.scan(step, state, us)
+    return rews, pipline_states
+
+
 @jax.jit
 def softmax_update(weights, Y0s, sigma, mu_0t):
     mu_0tm1 = jnp.einsum("n,nij->ij", weights, Y0s)
@@ -49,7 +68,16 @@ def softmax_update(weights, Y0s, sigma, mu_0t):
 
 
 class MBDPI:
-    def __init__(self, args: DialConfig, env):
+    def __init__(self, args: DialConfig, env, model_step_fn=None):
+        """`model_step_fn`, if given, is a `step(model, state, action) -> state` whose
+        physics model arrives as a traced argument. Supplying it enables the optional
+        `reverse_once(..., model=...)` path; leaving it None keeps this class exactly as
+        it was, with the env's model baked in as a closure constant.
+
+        The function itself is fixed for the env's lifetime, so passing it here is safe
+        even though `reverse_once` is jitted with `self` static (and hashed by identity).
+        Only the model *values* vary per call, and those travel as a real argument.
+        """
         self.args = args
         self.env = env
         self.nu = env.action_size
@@ -79,6 +107,18 @@ class MBDPI:
         # setup function
         self.rollout_us = jax.jit(functools.partial(rollout_us, self.env.step))
         self.rollout_us_vmap = jax.jit(jax.vmap(self.rollout_us, in_axes=(None, 0)))
+        # Optional model-as-argument variant. `in_axes=(None, None, 0)` broadcasts the
+        # model and the state and maps over the Nsample control-sequence batch, so the
+        # model is stored once, not replicated per sample.
+        self.model_step_fn = model_step_fn
+        self.rollout_us_model_vmap = None
+        if model_step_fn is not None:
+            self.rollout_us_model = jax.jit(
+                functools.partial(rollout_us_model, model_step_fn)
+            )
+            self.rollout_us_model_vmap = jax.jit(
+                jax.vmap(self.rollout_us_model, in_axes=(None, None, 0))
+            )
         self.node2u_vmap = jax.jit(
             jax.vmap(self.node2u, in_axes=(1), out_axes=(1))
         )  # process (horizon, node)
@@ -101,7 +141,7 @@ class MBDPI:
         return nodes
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def reverse_once(self, state, rng, Ybar_i, noise_scale):
+    def reverse_once(self, state, rng, Ybar_i, noise_scale, model=None):
         # sample from q_i
         rng, Y0s_rng = jax.random.split(rng)
         eps_Y = jax.random.normal(
@@ -117,25 +157,63 @@ class MBDPI:
         us = self.node2u_vvmap(Y0s)
 
         # esitimate mu_0tm1
-        rewss, pipeline_statess = self.rollout_us_vmap(state, us)
+        # `model is None` is a trace-time Python test, so the two branches compile to
+        # separate cache entries and never interfere. A 4-argument call -- which is what
+        # all pre-existing callers make -- takes the original path unchanged.
+        if model is None:
+            rewss, pipeline_statess = self.rollout_us_vmap(state, us)
+        else:
+            if self.rollout_us_model_vmap is None:
+                raise RuntimeError(
+                    "reverse_once(..., model=...) requires MBDPI(..., model_step_fn=...)"
+                )
+            rewss, pipeline_statess = self.rollout_us_model_vmap(model, state, us)
         rew_Ybar_i = rewss[-1].mean()
         qss = pipeline_statess.q
         qdss = pipeline_statess.qd
         xss = pipeline_statess.x.pos
         rews = rewss.mean(axis=-1)
-        logp0 = (rews - rew_Ybar_i) / rews.std(axis=-1) / self.args.temp_sample
+
+        # Reject samples whose imagined rollout diverged, instead of letting them poison
+        # the whole update. A single non-finite entry among the Nsample+1 rollouts makes
+        # `rews.std()` NaN, hence every `logp0` NaN, hence `softmax` all-NaN, hence a NaN
+        # control -- so one bad sample silently destroys the step and every step after it.
+        # Divergence is reachable whenever the model is stiff for this integration step
+        # (the H1 configs run a 20 ms step), which randomized parameters make far more
+        # likely than the hand-tuned nominal ones.
+        finite = jnp.isfinite(rews)
+        n_finite = jnp.maximum(finite.sum(), 1)
+        mean_finite = jnp.where(finite, rews, 0.0).sum() / n_finite
+        rews_safe = jnp.where(finite, rews, mean_finite)
+        # The Ybar_i sample (appended last) can diverge too, which would bias every logp0.
+        rew_Ybar_i = jnp.where(jnp.isfinite(rew_Ybar_i), rew_Ybar_i, mean_finite)
+        std = rews_safe.std(axis=-1)
+        std = jnp.where(std > 0.0, std, 1.0)  # also guards the all-equal-rewards case
+
+        logp0 = (rews_safe - rew_Ybar_i) / std / self.args.temp_sample
+        logp0 = jnp.where(finite, logp0, -jnp.inf)  # diverged samples get zero weight
 
         weights = jax.nn.softmax(logp0)
-        Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
+        # Zeroing the diverged samples' trajectories is not redundant with the zero
+        # weights above: 0 * NaN is NaN, so without this the weighted means below would
+        # still come out NaN.
+        keep3 = finite[:, None, None]
+        Y0s_k = jnp.where(keep3, Y0s, 0.0)
+        qss_k = jnp.where(keep3, qss, 0.0)
+        qdss_k = jnp.where(keep3, qdss, 0.0)
+        xss_k = jnp.where(finite[:, None, None, None], xss, 0.0)
+
+        Ybar, new_noise_scale = self.update_fn(weights, Y0s_k, noise_scale, Ybar_i)
 
         # NOTE: update only with reward
-        Ybar = jnp.einsum("n,nij->ij", weights, Y0s)
-        qbar = jnp.einsum("n,nij->ij", weights, qss)
-        qdbar = jnp.einsum("n,nij->ij", weights, qdss)
-        xbar = jnp.einsum("n,nijk->ijk", weights, xss)
+        Ybar = jnp.einsum("n,nij->ij", weights, Y0s_k)
+        qbar = jnp.einsum("n,nij->ij", weights, qss_k)
+        qdbar = jnp.einsum("n,nij->ij", weights, qdss_k)
+        xbar = jnp.einsum("n,nijk->ijk", weights, xss_k)
 
         info = {
             "rews": rews,
+            "frac_diverged": 1.0 - finite.mean(),
             "qbar": qbar,
             "qdbar": qdbar,
             "xbar": xbar,

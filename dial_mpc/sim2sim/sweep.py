@@ -370,6 +370,36 @@ def main():
         summary["paired_delta_return_mean"] = float(np.nanmean(deltas))
         summary["paired_delta_return_std"] = float(np.nanstd(deltas))
         summary["paired_trials_usable"] = int(np.isfinite(deltas).sum())
+
+        # `paired_delta_return_mean` above is CONFOUNDED and must not be read as the
+        # headline. `return_mean` divides by `steps_survived`, so when the two arms die at
+        # different times they are averaging over different horizons. Because per-step
+        # reward here is negative, an arm that dies early posts a *higher* mean -- a trial
+        # where both arms collapsed in ~30 steps contributed +2.6 to the delta while the
+        # bulk of the sweep sat near 0. `return_sum` is biased the opposite way (surviving
+        # longer accumulates more negative reward). The two metrics below are the ones that
+        # are actually comparable across arms.
+        a_steps = np.array([r["steps_survived"] for r in rand_rows], dtype=float)
+        b_steps = np.array([r["steps_survived"] for r in nom_rows], dtype=float)
+        d_steps = a_steps - b_steps
+        n_d = max(len(d_steps), 1)
+        summary["paired_delta_steps_mean"] = float(np.nanmean(d_steps))
+        summary["paired_delta_steps_sem"] = float(np.nanstd(d_steps, ddof=1) / np.sqrt(n_d))
+        summary["nominal_planner_steps_mean"] = float(np.nanmean(a_steps))
+        summary["true_planner_steps_mean"] = float(np.nanmean(b_steps))
+        summary["nominal_planner_full_episode_rate"] = float((a_steps >= dial_config.n_steps).mean())
+        summary["true_planner_full_episode_rate"] = float((b_steps >= dial_config.n_steps).mean())
+
+        # Reward restricted to pairs where BOTH arms ran the full horizon: equal horizon,
+        # so the per-step means are directly comparable and the censoring bias is gone.
+        both = (a_steps >= dial_config.n_steps) & (b_steps >= dial_config.n_steps)
+        d_eh = deltas[both]
+        d_eh = d_eh[np.isfinite(d_eh)]
+        summary["equal_horizon_pairs"] = int(len(d_eh))
+        if len(d_eh) >= 2:
+            summary["equal_horizon_delta_return_mean"] = float(d_eh.mean())
+            summary["equal_horizon_delta_return_sem"] = float(
+                d_eh.std(ddof=1) / np.sqrt(len(d_eh)))
     # Compile guards: these are fixed costs that must NOT grow with the number of trials.
     # If a parameter draw forced a retrace, runtime would collapse and -- worse -- the two
     # arms could end up running different compiled code, making them incomparable.

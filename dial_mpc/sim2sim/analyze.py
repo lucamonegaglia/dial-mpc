@@ -86,8 +86,10 @@ def _theta_columns(rows: List[Dict]) -> List[str]:
     known = {
         "trial", "group", "seed", "return_sum", "return_mean", "steps_survived",
         "survived", "plan_return_mean", "optimism_gap", "pred_err_1step",
-        "vel_err", "yaw_rate_err", "torque_rms",
+        "vel_err", "yaw_rate_err", "torque_rms", "diverged", "frac_diverged",
     }
+    # NOTE: this is a denylist, so every new per-trial metric must be added here or it
+    # gets mistaken for a randomized parameter and shows up as a spurious NaN row.
     if not rows:
         return []
     return sorted(k for k in rows[0] if k not in known)

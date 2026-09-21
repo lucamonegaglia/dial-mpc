@@ -64,30 +64,34 @@ def _select_interesting(
     Four qualitatively different kinds of divergence, taken together rather than just
     ranking by |delta return|, because they answer different questions:
 
-      * `true_planner_much_worse` -- the true-parameter planner's return_mean is more than
-        `much_worse_frac` lower than the nominal-parameter planner's, despite having the
-        correct model. Reserved a slot unconditionally: this is the one
-        category a caller explicitly wants guaranteed, so it is not subject to the
-        round-robin below.
       * `survival_flip` -- one arm fell and the other did not. Same plant, same seed, so
         this is purely the planner's model error deciding the episode. The clearest
         possible domain-shift failure, and invisible in a mean.
-      * `nominal_planner_worse` / `nominal_planner_better` -- the extreme tails of paired
-        delta return. The `better` side matters: the nominal-parameter planner beating the
-        true-parameter planner means model error was not the binding constraint for that
-        draw (sampling noise, or a mismatch that happened to help).
+      * `true_planner_worse` -- the positive tail of paired delta return: the
+        true-parameter planner did worse despite having the correct model. Pairs whose
+        shortfall exceeds `much_worse_frac` of the nominal arm's return are additionally
+        reserved a slot (see below).
+      * `nominal_planner_worse` -- the negative tail, i.e. model error was the binding
+        constraint for that draw, the direction the sweep is nominally looking for.
       * `steps_gap` -- largest |delta steps survived|, which catches pairs that both
         eventually fall but at very different times.
 
-    Selection is two-phase: `true_planner_much_worse` trials are reserved first (up to
-    `n_keep`), then the remaining slots are filled round-robin across the other four
-    categories. A straight priority sort (survival flips always first) previously let one
-    crowded category consume every slot -- concretely, a 256-trial run had >=12 distinct
-    `survival_flip` pairs, so they filled all 12 slots and silently dropped the single
-    largest |delta_return| pair in the whole run (tagged only `nominal_planner_better`).
+    Selection is two-phase: trials clearing the `much_worse_frac` threshold are reserved
+    first (up to `n_keep`), then the remaining slots are filled round-robin across the
+    four categories. A straight priority sort (survival flips always first) previously let
+    one crowded category consume every slot -- concretely, a 256-trial run had >=12
+    distinct `survival_flip` pairs, so they filled all 12 slots and silently dropped the
+    single largest |delta_return| pair in the whole run (tagged only `true_planner_worse`).
     Round-robin instead gives every category a turn.
+
+    The threshold and the positive tail used to be separate tags
+    (`true_planner_much_worse` / `nominal_planner_better`); since `delta_return` is
+    `return_nominal_planner - return_true_planner`, they were the same direction and the
+    threshold set was a subset of the tail, which double-tagged pairs and gave that
+    direction two round-robin turns against the negative tail's one.
     """
     tagged: Dict[int, Dict[str, Any]] = {}
+    reserved: set = set()
 
     def tag(pair: Dict[str, Any], reason: str):
         entry = tagged.setdefault(pair["trial"], {"pair": pair, "reasons": []})
@@ -99,17 +103,18 @@ def _select_interesting(
             tag(p, "survival_flip")
         nom_r, true_r = p["return_nominal_planner"], p["return_true_planner"]
         if true_r <= nom_r - much_worse_frac * abs(nom_r):
-            tag(p, "true_planner_much_worse")
+            tag(p, "true_planner_worse")
+            reserved.add(p["trial"])
 
     # Each bucket is sign-filtered so a tag always means what it says. Without that, a
-    # sweep with fewer pairs than 2 * per_bucket tags the same pair both `worse` and
-    # `better`, and tags `steps_gap` on pairs whose arms survived equally long.
+    # sweep with fewer pairs than 2 * per_bucket tags the same pair as both tails, and
+    # tags `steps_gap` on pairs whose arms survived equally long.
     by_delta = sorted(pairs, key=lambda p: p["delta_return"])
     per_bucket = max(1, n_keep // 4)
     for p in [q for q in by_delta if q["delta_return"] < 0][:per_bucket]:
         tag(p, "nominal_planner_worse")
     for p in [q for q in reversed(by_delta) if q["delta_return"] > 0][:per_bucket]:
-        tag(p, "nominal_planner_better")
+        tag(p, "true_planner_worse")
     for p in [q for q in sorted(pairs, key=lambda q: -abs(q["delta_steps"]))
               if q["delta_steps"] != 0][:per_bucket]:
         tag(p, "steps_gap")
@@ -117,14 +122,13 @@ def _select_interesting(
     by_extremity = lambda e: -abs(e["pair"]["delta_return"])
 
     selected: Dict[int, Dict[str, Any]] = {}
-    for e in sorted((e for e in tagged.values() if "true_planner_much_worse" in e["reasons"]),
-                     key=by_extremity):
+    for e in sorted((tagged[t] for t in reserved), key=by_extremity):
         if len(selected) >= n_keep:
             break
         selected[e["pair"]["trial"]] = e
 
     round_robin_categories = ["survival_flip", "nominal_planner_worse",
-                              "nominal_planner_better", "steps_gap"]
+                              "true_planner_worse", "steps_gap"]
     by_category = {
         c: sorted((e for e in tagged.values() if c in e["reasons"]), key=by_extremity)
         for c in round_robin_categories

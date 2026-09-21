@@ -49,6 +49,7 @@ from dial_mpc.utils.io_utils import load_dataclass_from_dict
 # Revert just that rcParam rather than the whole style, since the rest of it is harmless.
 plt.rcParams["text.usetex"] = False
 
+from dial_mpc.sim2sim import determinism
 from dial_mpc.sim2sim.groups import GROUP_NOMINAL_PLANNER, GROUP_TRUE_PLANNER
 from dial_mpc.sim2sim.randomize import ParamSpec, apply_theta, load_domain_rand_config, resolve_specs
 from dial_mpc.sim2sim.runner import (
@@ -208,7 +209,18 @@ def main():
                          help="one or more trial indices to reproduce")
     parser.add_argument("--html", action="store_true", help="also write brax 3D playbacks")
     parser.add_argument("--force", action="store_true", help="regenerate even if already saved")
+    parser.add_argument("--determinism", choices=determinism.MODES, default="exact",
+                        help="replay defaults to 'exact' (CPU, bitwise reproducible) so a "
+                             "trial replays identically; 'fast' uses the GPU but will not "
+                             "match the original step-for-step")
+    parser.add_argument("--matmul-precision", choices=determinism.PRECISIONS,
+                        default="default",
+                        help="'highest' disables TF32 f32 matmuls, matching CPU physics to "
+                             "~1e-5 relative at ~12%% cost; the TF32 default is off by ~600x "
+                             "the run-to-run spread")
     args = parser.parse_args()
+
+    determinism.configure(args.determinism, args.matmul_precision)
 
     ctx = build_context(args.run)
     for trial in args.trial:

@@ -29,6 +29,7 @@ from dial_mpc.core.dial_config import DialConfig
 from dial_mpc.core.dial_core import MBDPI
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 
+from dial_mpc.sim2sim import determinism
 from dial_mpc.sim2sim.randomize import load_domain_rand_config, resolve_specs, sample_theta, apply_theta
 from dial_mpc.sim2sim.groups import GROUP_NOMINAL_PLANNER, GROUP_TRUE_PLANNER, GROUPS
 from dial_mpc.sim2sim.runner import (
@@ -305,7 +306,17 @@ def main():
     parser.add_argument("--custom-env", type=str, default=None)
     parser.add_argument("--n-trials", type=int, default=None, help="override domain_randomization.n_trials")
     parser.add_argument("--n-steps", type=int, default=None, help="override n_steps (for smoke tests)")
+    parser.add_argument("--determinism", choices=determinism.MODES, default="fast",
+                        help="'exact' forces the CPU backend for bitwise-reproducible "
+                             "trials (~23x slower); see dial_mpc/sim2sim/determinism.py")
+    parser.add_argument("--matmul-precision", choices=determinism.PRECISIONS,
+                        default="default",
+                        help="'highest' disables TF32 f32 matmuls, matching CPU physics to "
+                             "~1e-5 relative at ~12%% cost; the TF32 default is off by ~600x "
+                             "the run-to-run spread")
     args = parser.parse_args()
+
+    determinism_info = determinism.configure(args.determinism, args.matmul_precision)
 
     if args.custom_env is not None:
         import importlib
@@ -365,7 +376,8 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     if drc.save_rollouts:
         os.makedirs(os.path.join(run_dir, "rollouts"), exist_ok=True)
-    config_dict = dict(config_dict, git=_git_provenance(run_dir))
+    config_dict = dict(config_dict, git=_git_provenance(run_dir),
+                       determinism=determinism_info)
     with open(os.path.join(run_dir, "config_used.yaml"), "w") as f:
         yaml.safe_dump(config_dict, f, default_flow_style=False)
 

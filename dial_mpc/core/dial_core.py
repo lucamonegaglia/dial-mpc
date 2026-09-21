@@ -39,8 +39,8 @@ def rollout_us(step_env, state, us):
         state = step_env(state, u)
         return state, (state.reward, state.pipeline_state)
 
-    _, (rews, pipline_states) = jax.lax.scan(step, state, us)
-    return rews, pipline_states
+    _, (rews, pipeline_states) = jax.lax.scan(step, state, us)
+    return rews, pipeline_states
 
 
 def rollout_us_model(step_env_model, model, state, us):
@@ -51,8 +51,8 @@ def rollout_us_model(step_env_model, model, state, us):
         state = step_env_model(model, state, u)
         return state, (state.reward, state.pipeline_state)
 
-    _, (rews, pipline_states) = jax.lax.scan(step, state, us)
-    return rews, pipline_states
+    _, (rews, pipeline_states) = jax.lax.scan(step, state, us)
+    return rews, pipeline_states
 
 
 @jax.jit
@@ -175,9 +175,16 @@ class MBDPI:
         # move it. Trimming affects the scale only, never the ranking.
         finite = jnp.isfinite(rews)
         TRIM = 0.02
-        rews_hi = cast(jnp.ndarray, jnp.where(finite, rews, jnp.inf))  # non-finite sort out of both quantiles
-        inlier = finite & (rews >= jnp.quantile(rews_hi, TRIM)) & (
-            rews <= jnp.quantile(rews_hi, 1.0 - TRIM)
+        # nanquantile, not quantile-over-a-+inf-filled copy: with the latter, once more
+        # than TRIM of the samples diverge the 1-TRIM quantile IS +inf, so the upper tail
+        # stops being trimmed at exactly the divergence rates where trimming matters most
+        # (and below that rate the +inf entries still occupy slots in the upper tail, so
+        # fewer than TRIM of the finite samples get excluded). nanquantile drops the
+        # non-finite entries from the population instead, so TRIM always means TRIM of
+        # the surviving samples.
+        rews_in = cast(jnp.ndarray, jnp.where(finite, rews, jnp.nan))
+        inlier = finite & (rews >= jnp.nanquantile(rews_in, TRIM)) & (
+            rews <= jnp.nanquantile(rews_in, 1.0 - TRIM)
         )
         n_in = jnp.maximum(inlier.sum(), 1)
         mu = jnp.where(inlier, rews, 0.0).sum() / n_in

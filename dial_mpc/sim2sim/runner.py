@@ -403,7 +403,17 @@ def run_trial(
 
         ps = pipeline_of(state)
         r = float(state.reward)
-        if not np.isfinite(r):
+        qpos, qvel = np.asarray(ps.qpos), np.asarray(ps.qvel)
+        # The reward alone is not a sufficient divergence test. It reads only the torso,
+        # the feet and `ctrl`, so a non-finite value confined to dofs it never touches
+        # leaves it finite -- and `done` is built from `<`/`>` comparisons, which are all
+        # False on NaN, so the trial would be recorded as a clean survival with a corrupt
+        # state log. (On unitree_h1_loco, qpos is exactly the 7 free-base + 11 actuated
+        # dofs and MJX's global solve spreads any NaN across all of them within one step,
+        # so the reward does catch it there; this guard is for the envs where it would
+        # not, e.g. ones carrying unactuated dofs.) qpos/qvel are pulled to the host for
+        # the log below either way, so checking them here costs nothing extra.
+        if not (np.isfinite(r) and np.isfinite(qpos).all() and np.isfinite(qvel).all()):
             # The plant received a non-finite action, or integrated to a non-finite state.
             # Stop here and record it as a divergence rather than a survival.
             diverged = True
@@ -420,8 +430,8 @@ def run_trial(
         if prev_qbar1 is not None:
             pred_errs.append(float(jnp.linalg.norm(ps.q - prev_qbar1)))
 
-        log["qpos"].append(np.asarray(ps.qpos))
-        log["qvel"].append(np.asarray(ps.qvel))
+        log["qpos"].append(qpos)
+        log["qvel"].append(qvel)
         log["action"].append(np.asarray(action))
         log["ctrl"].append(np.asarray(ps.ctrl))
         log["reward"].append(np.asarray(r, dtype=np.float32))

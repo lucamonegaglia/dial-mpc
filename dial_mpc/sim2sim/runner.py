@@ -404,15 +404,6 @@ def run_trial(
         ps = pipeline_of(state)
         r = float(state.reward)
         qpos, qvel = np.asarray(ps.qpos), np.asarray(ps.qvel)
-        # The reward alone is not a sufficient divergence test. It reads only the torso,
-        # the feet and `ctrl`, so a non-finite value confined to dofs it never touches
-        # leaves it finite -- and `done` is built from `<`/`>` comparisons, which are all
-        # False on NaN, so the trial would be recorded as a clean survival with a corrupt
-        # state log. (On unitree_h1_loco, qpos is exactly the 7 free-base + 11 actuated
-        # dofs and MJX's global solve spreads any NaN across all of them within one step,
-        # so the reward does catch it there; this guard is for the envs where it would
-        # not, e.g. ones carrying unactuated dofs.) qpos/qvel are pulled to the host for
-        # the log below either way, so checking them here costs nothing extra.
         if not (np.isfinite(r) and np.isfinite(qpos).all() and np.isfinite(qvel).all()):
             # The plant received a non-finite action, or integrated to a non-finite state.
             # Stop here and record it as a divergence rather than a survival.
@@ -456,19 +447,7 @@ def run_trial(
         # The planner's 1-step prediction of the configuration the plant will reach next,
         # under whichever PLANNER model this trial was given: qbar[-1] is the last diffusion
         # iterate's weighted-mean predicted trajectory from the state just reached above, and
-        # its index 0 is the configuration after applying us[0] == Y0[0] -- exactly the action
-        # the next iteration applies to the plant. (`rollout_us` emits post-step states only;
-        # there is no initial state at index 0.)
-        #
-        # `q`, not `x.pos`: brax fills `x` from `data.xpos` after `mjx.step`, and MuJoCo runs
-        # forward kinematics *before* integrating, so `x` lags `q` by one step. Comparing
-        # x.pos against x.pos measures nothing (both sides are kinematics of the same qpos,
-        # agreeing to ~2e-7); `q` is post-integration and correctly aligned.
-        #
-        # Near zero with the true parameters, though not exactly: qbar is a weighted mean
-        # over the sample set, not a rollout of the applied Y0[0]. Units are mixed (metres
-        # for the free-joint translation, unitless quaternion, radians for the joints) --
-        # it is a diagnostic scalar, not a physical distance.
+        # its index 0 is the configuration after applying us[0] == Y0[0]
         prev_qbar1 = info["qbar"][-1][0]
 
     plan_return_mean = float(np.mean(plan_returns)) if plan_returns else 0.0

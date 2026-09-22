@@ -22,6 +22,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
 
 from dial_mpc.sim2sim.groups import (
     DISPLAY, GROUPS, GROUP_NOMINAL_PLANNER, GROUP_TRUE_PLANNER,
@@ -136,15 +137,12 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
         patch.set_edgecolor(_SURFACE)
         patch.set_linewidth(1.0)
     ax.axvline(0.0, color=_INK_MUTED, linewidth=1.2, linestyle=(0, (3, 2)), zorder=3)
-    # A handful of trials sit far out in either tail; a linear y-axis makes the near-zero
-    # bulk unreadable once they're in frame, so log-scale keeps both visible without
-    # changing the bins or hiding the outliers.
-    ax.set_yscale("symlog", linthresh=1)
+    ax.yaxis.set_major_locator(MaxNLocator(integer=True))  # counts, so no half-trial ticks
     _style_axes(ax)
     ax.set_xlabel("\n".join(textwrap.wrap(
         "Δ total reward (nominal-parameter − true-parameter planner, same plant & seed).",
         width=60)))
-    ax.set_ylabel("Trial count (log)")
+    ax.set_ylabel("Trial count")
     ax.set_title("Cost of planning with the wrong model", color=_INK, fontsize=11, loc="left")
     fig.tight_layout()
     fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")

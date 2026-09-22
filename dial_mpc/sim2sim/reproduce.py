@@ -175,9 +175,10 @@ def reproduce_trial(ctx: ReproContext, trial: int, html: bool = False, force: bo
     )
     results = {GROUP_NOMINAL_PLANNER: result_nom, GROUP_TRUE_PLANNER: result_true}
 
-    print(f"\n{'group':<16}{'steps':>7}{'survived':>10}{'return_mean':>14}")
+    print(f"\n{'group':<16}{'steps':>7}{'survived':>10}{'return_sum':>14}{'per step':>12}")
     for group, r in results.items():
-        print(f"{group:<16}{r.steps_survived:>7}{str(r.survived):>10}{r.return_mean:>14.4f}")
+        print(f"{group:<16}{r.steps_survived:>7}{str(r.survived):>10}"
+              f"{r.return_sum:>14.4f}{r.return_mean:>12.4f}")
 
     os.makedirs(trial_dir, exist_ok=True)
     theta_json = json.dumps({k: np.asarray(v).tolist() for k, v in theta_np.items()})
@@ -195,7 +196,7 @@ def reproduce_trial(ctx: ReproContext, trial: int, html: bool = False, force: bo
         )
         print(f"Wrote {path}")
 
-    delta_return = result_nom.return_mean - result_true.return_mean
+    delta_return = result_nom.return_sum - result_true.return_sum
     delta_steps = result_nom.steps_survived - result_true.steps_survived
     title = f"Trial {trial} (reproduced) — Δreturn {delta_return:+.4f}, Δsteps {delta_steps:+d}"
     generate_trial_outputs(os.path.abspath(ctx.run_dir), trial_dir, title, html=html)

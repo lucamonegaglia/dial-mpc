@@ -50,8 +50,8 @@ def _flatten_theta(theta: Dict[str, np.ndarray]) -> Dict[str, float]:
     return row
 
 
-# A trial where the true-parameter planner's return_mean is this much lower (more
-# negative) than the nominal-parameter planner's is always kept, even if every other
+# A trial where the true-parameter planner's total return is this much lower than the
+# nominal-parameter planner's is always kept, even if every other
 # slot is already spoken for -- see `_select_interesting`.
 TRUE_PLANNER_MUCH_WORSE_FRAC = 0.5
 
@@ -63,11 +63,13 @@ def _select_interesting(
     """Pick the trial pairs worth keeping a full state log for.
 
     Four qualitatively different kinds of divergence, taken together rather than just
-    ranking by |delta return|, because they answer different questions:
+    ranking by |delta return|, because they answer different questions. `delta_return` is
+    a difference of TOTAL trajectory returns, so a fall already costs the arm every step it
+    did not live to collect; the categories below still separate *how* the arms diverged.
 
       * `survival_flip` -- one arm fell and the other did not. Same plant, same seed, so
         this is purely the planner's model error deciding the episode. The clearest
-        possible domain-shift failure, and invisible in a mean.
+        possible domain-shift failure.
       * `true_planner_worse` -- the positive tail of paired delta return: the
         true-parameter planner did worse despite having the correct model. Pairs whose
         shortfall exceeds `much_worse_frac` of the nominal arm's return are additionally
@@ -262,10 +264,10 @@ def _write_interesting(
             "reasons": entry["reasons"],
             "delta_return": pair["delta_return"],
             "delta_steps": pair["delta_steps"],
-            GROUP_NOMINAL_PLANNER: {"return_mean": pair["return_nominal_planner"],
+            GROUP_NOMINAL_PLANNER: {"return_sum": pair["return_nominal_planner"],
                                     "steps_survived": pair["steps_nominal_planner"],
                                     "survived": pair["survived_nominal_planner"]},
-            GROUP_TRUE_PLANNER: {"return_mean": pair["return_true_planner"],
+            GROUP_TRUE_PLANNER: {"return_sum": pair["return_true_planner"],
                                  "steps_survived": pair["steps_true_planner"],
                                  "survived": pair["survived_true_planner"]},
             "files": files,
@@ -362,9 +364,11 @@ def main():
     diffuse = DiffuseStepper(mbdpi, dial_config)
 
     if drc.terminate_on_physical_limits:
-        # This decides when the PLANT's episode ends, which is the whole point. Set on the
-        # planner env too only for consistency: `rollout_us` never truncates on `done`, and
-        # UnitreeH1LocoEnv weights reward_alive at 0.0, so planner-side it is a no-op today.
+        # This decides when the PLANT's episode ends, which is the whole point. Setting it on
+        # the planner env is no longer cosmetic: `rollout_us` still never truncates on `done`,
+        # but UnitreeH1LocoEnv now weights `reward_alive` at 1.0 (unitree_h1_env.py:824), so a
+        # wider termination band leaves `done` at 0 for longer and the planner scores those
+        # sampled rollouts higher. Both envs get the same band so the two arms stay comparable.
         planner_env.terminate_on_physical_limits = True
         plant_env.terminate_on_physical_limits = True
         print("Termination: physical joint limits (not the narrower action-scaling band)")
@@ -441,7 +445,7 @@ def main():
                                      f"trial_{i:04d}_{GROUP_TRUE_PLANNER}.npz"),
                         **nominal_result.rollout,
                     )
-                delta = result.return_mean - nominal_result.return_mean
+                delta = result.return_sum - nominal_result.return_sum
                 pairs.append({
                     "trial": i,
                     "seed": trial_seed,
@@ -449,15 +453,15 @@ def main():
                     "delta_steps": result.steps_survived - nominal_result.steps_survived,
                     "survived_nominal_planner": result.survived,
                     "survived_true_planner": nominal_result.survived,
-                    "return_nominal_planner": result.return_mean,
-                    "return_true_planner": nominal_result.return_mean,
+                    "return_nominal_planner": result.return_sum,
+                    "return_true_planner": nominal_result.return_sum,
                     "steps_nominal_planner": result.steps_survived,
                     "steps_true_planner": nominal_result.steps_survived,
                     "theta": {k: np.asarray(v).tolist() for k, v in theta.items()},
                 })
-                pbar.set_postfix({"ret": f"{result.return_mean:.2e}", "d_ret": f"{delta:.2e}"})
+                pbar.set_postfix({"ret": f"{result.return_sum:.1f}", "d_ret": f"{delta:+.1f}"})
             else:
-                pbar.set_postfix({"ret": f"{result.return_mean:.2e}"})
+                pbar.set_postfix({"ret": f"{result.return_sum:.1f}"})
 
     fieldnames = sorted({k for row in rows for k in row})
     fieldnames = ["trial", "group", "seed"] + [f for f in fieldnames if f not in ("trial", "group", "seed")]
@@ -475,8 +479,8 @@ def main():
         "theta_columns": theta_columns,
         "env_name": dial_config.env_name,
         "n_steps": dial_config.n_steps,
-        "return_mean": float(np.nanmean([r["return_mean"] for r in rand_rows])),
-        "return_std": float(np.nanstd([r["return_mean"] for r in rand_rows])),
+        "return_sum_mean": float(np.nanmean([r["return_sum"] for r in rand_rows])),
+        "return_sum_std": float(np.nanstd([r["return_sum"] for r in rand_rows])),
         "survival_rate": float(np.mean([r["survived"] for r in rand_rows])),
         "diverged_trials": int(sum(r["diverged"] for r in rows)),
         "planner_frac_diverged_mean": float(np.nanmean([r["frac_diverged"] for r in rows])),
@@ -486,12 +490,12 @@ def main():
     if drc.paired:
         nom_rows = [r for r in rows if r["group"] == GROUP_TRUE_PLANNER]
         deltas = np.array(
-            [rr["return_mean"] - nr["return_mean"] for rr, nr in zip(rand_rows, nom_rows)],
+            [rr["return_sum"] - nr["return_sum"] for rr, nr in zip(rand_rows, nom_rows)],
             dtype=float,
         )
-        summary["true_planner_return_mean"] = float(np.nanmean([r["return_mean"] for r in nom_rows]))
-        summary["paired_delta_return_mean"] = float(np.nanmean(deltas))
-        summary["paired_delta_return_std"] = float(np.nanstd(deltas))
+        summary["true_planner_return_sum_mean"] = float(np.nanmean([r["return_sum"] for r in nom_rows]))
+        summary["paired_delta_return_sum_mean"] = float(np.nanmean(deltas))
+        summary["paired_delta_return_sum_std"] = float(np.nanstd(deltas))
         summary["paired_trials_usable"] = int(np.isfinite(deltas).sum())
     # Compile guards: fixed costs that must NOT grow with the number of trials. A draw that
     # forced a retrace would collapse runtime and, worse, could leave the two arms running

@@ -299,6 +299,12 @@ class DiffuseStepper:
 @dataclass
 class TrialResult:
     theta: Dict[str, np.ndarray]
+    # Headline metric: total reward accumulated over the trajectory, with the steps after
+    # termination contributing nothing. UnitreeH1LocoEnv now weights `reward_alive` at 1.0
+    # (unitree_h1_env.py:824), so surviving longer earns more and a fall is paid for in the
+    # metric itself. `return_mean` divides this by the steps actually survived, which cancels
+    # exactly that signal -- a plant that falls at step 8 can post the same mean as one that
+    # walks all 400 -- so it is kept only as the per-step scale that `optimism_gap` needs.
     return_sum: float
     return_mean: float
     steps_survived: int
@@ -453,7 +459,9 @@ def run_trial(
     plan_return_mean = float(np.mean(plan_returns)) if plan_returns else 0.0
     return_mean = return_sum / steps_survived if steps_survived > 0 else 0.0
     if diverged and steps_survived == 0:
+        # Nothing was measured, and a 0.0 total would rank as a legitimate score.
         return_mean = float("nan")
+        return_sum = float("nan")
 
     rollout: Dict[str, np.ndarray] = {k: np.stack(v) for k, v in log.items() if v}
     rollout["time"] = np.arange(len(log["reward"]), dtype=np.float64) * float(stepper.plant_env.dt)
@@ -467,6 +475,8 @@ def run_trial(
         diverged=diverged,
         frac_diverged=float(np.mean(frac_div)) if frac_div else 0.0,
         plan_return_mean=plan_return_mean,
+        # Per-step on both sides: `rew_plan` is a mean over the planner's Hsample horizon
+        # (dial_core.py:226), so differencing it against `return_sum` would be unitless noise.
         optimism_gap=plan_return_mean - return_mean,
         pred_err_1step=float(np.mean(pred_errs)) if pred_errs else float("nan"),
         vel_err=float(np.mean(vel_errs)) if vel_errs else float("nan"),

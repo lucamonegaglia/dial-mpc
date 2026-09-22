@@ -91,13 +91,16 @@ def fig_return_ecdf(rows: List[Dict], out_path: str):
     fig.patch.set_facecolor(_SURFACE)
     for group, color, label in ((GROUP_NOMINAL_PLANNER, _BLUE, DISPLAY[GROUP_NOMINAL_PLANNER]),
                                 (GROUP_TRUE_PLANNER, _ORANGE, DISPLAY[GROUP_TRUE_PLANNER])):
-        vals = sorted(r["return_mean"] for r in rows if r["group"] == group)
+        # A trial that diverged before its first step has a NaN return (runner.py) and
+        # would otherwise sort to the end of the ECDF as if it were the best trial.
+        vals = sorted(v for v in (r["return_sum"] for r in rows if r["group"] == group)
+                      if np.isfinite(v))
         if not vals:
             continue
         y = np.arange(1, len(vals) + 1) / len(vals)
         ax.step(vals, y, where="post", color=color, linewidth=2.0, solid_capstyle="round", label=label)
     _style_axes(ax)
-    ax.set_xlabel("Mean per-step reward")
+    ax.set_xlabel("Total trajectory reward")
     ax.set_ylabel("Cumulative fraction of trials")
     ax.set_title("Return distribution: domain shift vs nominal", color=_INK, fontsize=11, loc="left")
     # Both curves rise steeply into the lower-right corner, so a legend there sits on top
@@ -116,10 +119,11 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
     for r in rows:
         by_trial.setdefault(int(r["trial"]), {})[r["group"]] = r
     deltas = [
-        d[GROUP_NOMINAL_PLANNER]["return_mean"] - d[GROUP_TRUE_PLANNER]["return_mean"]
+        d[GROUP_NOMINAL_PLANNER]["return_sum"] - d[GROUP_TRUE_PLANNER]["return_sum"]
         for d in by_trial.values()
         if GROUP_NOMINAL_PLANNER in d and GROUP_TRUE_PLANNER in d
     ]
+    deltas = [d for d in deltas if np.isfinite(d)]
     if not deltas:
         return
     fig, ax = plt.subplots(figsize=(6, 4), dpi=150)
@@ -138,7 +142,7 @@ def fig_paired_delta(rows: List[Dict], out_path: str):
     ax.set_yscale("symlog", linthresh=1)
     _style_axes(ax)
     ax.set_xlabel("\n".join(textwrap.wrap(
-        "Δ mean reward (nominal-parameter − true-parameter planner, same plant & seed).",
+        "Δ total reward (nominal-parameter − true-parameter planner, same plant & seed).",
         width=60)))
     ax.set_ylabel("Trial count (log)")
     ax.set_title("Cost of planning with the wrong model", color=_INK, fontsize=11, loc="left")
@@ -200,7 +204,7 @@ def fig_sensitivity(rows: List[Dict], theta_cols: List[str], out_path: str):
     for i, col in enumerate(theta_cols):
         ax = axes[i // ncols][i % ncols]
         x = np.array([d[GROUP_NOMINAL_PLANNER][col] for d in paired])
-        y = np.array([d[GROUP_NOMINAL_PLANNER]["return_mean"] - d[GROUP_TRUE_PLANNER]["return_mean"] for d in paired])
+        y = np.array([d[GROUP_NOMINAL_PLANNER]["return_sum"] - d[GROUP_TRUE_PLANNER]["return_sum"] for d in paired])
         ax.scatter(x, y, s=14, color=_BLUE, alpha=0.75, edgecolors="none", zorder=2)
         ax.axhline(0.0, color=_INK_MUTED, linewidth=1.0, linestyle=(0, (3, 2)), zorder=1)
         rho = spearman(x, y)
@@ -294,9 +298,11 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_path: s
                             csv_path: str):
     """One bar per randomization axis, ranked by how much it moves the paired delta.
 
-    Two responses side by side because they disagree in an informative way: mean reward
-    is only averaged over the steps a trial survived, so a plant that falls immediately
-    can post a deceptively mild reward delta. Steps-survived captures that directly.
+    Two responses side by side because they decompose the same failure differently: total
+    reward folds in both how well the plant tracked and how long it stayed up (the env
+    weights `reward_alive` at 1.0), while steps-survived isolates the survival half. A
+    parameter that shows up in the first but not the second moved tracking quality, not
+    uptime.
     """
     by_trial: Dict[int, Dict[str, Dict]] = {}
     for r in rows:
@@ -310,7 +316,7 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_path: s
     if not groups:
         return
 
-    d_ret = np.array([d[GROUP_NOMINAL_PLANNER]["return_mean"] - d[GROUP_TRUE_PLANNER]["return_mean"] for d in paired])
+    d_ret = np.array([d[GROUP_NOMINAL_PLANNER]["return_sum"] - d[GROUP_TRUE_PLANNER]["return_sum"] for d in paired])
     d_steps = np.array([d[GROUP_NOMINAL_PLANNER]["steps_survived"] - d[GROUP_TRUE_PLANNER]["steps_survived"] for d in paired])
 
     stats: Dict[str, Dict[str, Dict[str, float]]] = {}
@@ -327,7 +333,7 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_path: s
     fig, axes = plt.subplots(1, 2, figsize=(11, 0.45 * len(order) + 2.9), dpi=150, sharey=True)
     fig.patch.set_facecolor(_SURFACE)
 
-    panels = [("return", "Δ mean reward", axes[0]), ("steps", "Δ steps survived", axes[1])]
+    panels = [("return", "Δ total reward", axes[0]), ("steps", "Δ steps survived", axes[1])]
     for key, label, ax in panels:
         betas = np.array([stats[k][key]["beta"] for k in order])
         los = np.array([stats[k][key]["lo"] for k in order])
@@ -404,8 +410,8 @@ def main():
         rand_rows = [r for r in rows if r["group"] == GROUP_NOMINAL_PLANNER]
         summary = {
             "n_trials": len(rand_rows),
-            "return_mean": float(np.mean([r["return_mean"] for r in rand_rows])),
-            "return_std": float(np.std([r["return_mean"] for r in rand_rows])),
+            "return_sum_mean": float(np.nanmean([r["return_sum"] for r in rand_rows])),
+            "return_sum_std": float(np.nanstd([r["return_sum"] for r in rand_rows])),
             "survival_rate": float(np.mean([r["survived"] for r in rand_rows])),
         }
     print(f"Figures written to {fig_dir}/")

@@ -10,6 +10,7 @@ from dial_mpc.envs.unitree_go2_env import (
     UnitreeGo2CrateEnvConfig,
 )
 from dial_mpc.envs.manipulation import AllegroReorientEnvConfig
+from dial_mpc.envs.limx_tron1_wf_env import LimxTron1WFEnvConfig
 
 _configs = {
     "unitree_h1_walk": UnitreeH1WalkEnvConfig,
@@ -19,6 +20,7 @@ _configs = {
     "unitree_go2_seq_jump": UnitreeGo2SeqJumpEnvConfig,
     "unitree_go2_crate_climb": UnitreeGo2CrateEnvConfig,
     "allegro_reorient": AllegroReorientEnvConfig,
+    "limx_tron1_wf_walk": LimxTron1WFEnvConfig,
 }
 
 

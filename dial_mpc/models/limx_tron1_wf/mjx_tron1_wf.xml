@@ -13,18 +13,20 @@
                 <geom type="mesh" contype="0" conaffinity="0" group="2" />
             </default>
             <!-- leg-link collision is disabled (contype/conaffinity 0): only the base box and the
-                 two wheels touch the floor, which keeps the contact count at 3 for MJX. -->
+                 two wheels touch the floor. Each cylinder wheel yields 2 floor contacts, so the
+                 standing robot sits at 4. -->
             <default class="leg_collision">
                 <geom group="3" contype="0" conaffinity="0" rgba="0 0 1 0" />
             </default>
             <default class="collision">
                 <geom group="3" contype="0" conaffinity="1" />
                 <default class="wheel">
-                    <!-- The wheel is a 10 mm thin disc, so its contact patch is effectively a
-                         point. Substituting a sphere for the cylinder gives 1 contact instead of
-                         up to 4 under MJX; the hinge is the wheel's only DOF, so it still rolls
-                         about its axis and slides laterally under friction. Visual stays a mesh. -->
-                    <geom type="sphere" size="0.127" solimp="0.015 1 0.031"
+                    <!-- Upstream cylinder (r=0.127, half-height 0.005), quat rotating its local z
+                         onto the hinge (y) axis. MJX supports PLANE x CYLINDER; this costs more
+                         contacts than a sphere but gives a true disc edge and a real contact patch
+                         rather than a point. Visual stays a mesh. -->
+                    <geom type="cylinder" size="0.127 0.005" quat="0.707107 0.707107 0 0"
+                        solimp="0.015 1 0.031"
                         friction="0.6 0.02 0.01" condim="3" rgba="1 0.423529 0.0392157 0.4" />
                 </default>
             </default>

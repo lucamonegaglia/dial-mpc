@@ -1,0 +1,82 @@
+{
+  "0.4": {
+    "flipflop_amp_first10": 0.07578889867290854,
+    "flipflop_amp_last10": 28.307476043701172,
+    "qvel_rms_last20": 28.790861129760742,
+    "qvel_lag1": -0.506028216926842,
+    "nonfinite_at": null,
+    "torso_z_end": 1.2766495943069458
+  },
+  "0.5": {
+    "flipflop_amp_first10": 0.04228250244632363,
+    "flipflop_amp_last10": 28.336219787597656,
+    "qvel_rms_last20": 13.54454231262207,
+    "qvel_lag1": -0.6870287897609914,
+    "nonfinite_at": null,
+    "torso_z_end": -0.9496681094169617
+  },
+  "0.55": {
+    "flipflop_amp_first10": 0.039401828730478886,
+    "flipflop_amp_last10": 0.30574552714824677,
+    "qvel_rms_last20": 1.8724167346954346,
+    "qvel_lag1": -0.5263712572018935,
+    "nonfinite_at": null,
+    "torso_z_end": -0.9861918687820435
+  },
+  "0.6": {
+    "flipflop_amp_first10": 0.03946914607658982,
+    "flipflop_amp_last10": 0.7943552613258362,
+    "qvel_rms_last20": 2.5362088680267334,
+    "qvel_lag1": -0.4260979574097589,
+    "nonfinite_at": null,
+    "torso_z_end": -0.7907727360725403
+  },
+  "0.65": {
+    "flipflop_amp_first10": 0.03955102143809199,
+    "flipflop_amp_last10": 1.6354301586747169,
+    "qvel_rms_last20": 2.553715705871582,
+    "qvel_lag1": -0.49929522713077323,
+    "nonfinite_at": null,
+    "torso_z_end": -0.6639996767044067
+  },
+  "0.7": {
+    "flipflop_amp_first10": 0.039625640184385705,
+    "flipflop_amp_last10": 0.6177299357950687,
+    "qvel_rms_last20": 1.1364644765853882,
+    "qvel_lag1": 0.23843734098585337,
+    "nonfinite_at": null,
+    "torso_z_end": -0.3747459948062897
+  },
+  "0.8": {
+    "flipflop_amp_first10": 0.03558071553707123,
+    "flipflop_amp_last10": 1.604172933101654,
+    "qvel_rms_last20": 2.8476076126098633,
+    "qvel_lag1": 0.21986768202720286,
+    "nonfinite_at": null,
+    "torso_z_end": -0.3256409466266632
+  },
+  "1.0": {
+    "flipflop_amp_first10": 0.03530597202479839,
+    "flipflop_amp_last10": 0.778058060631156,
+    "qvel_rms_last20": 1.0365841388702393,
+    "qvel_lag1": 0.4975266467436575,
+    "nonfinite_at": null,
+    "torso_z_end": -0.3775147497653961
+  },
+  "1.4": {
+    "flipflop_amp_first10": 0.03330256845802069,
+    "flipflop_amp_last10": 0.7239453814923763,
+    "qvel_rms_last20": 0.8691219091415405,
+    "qvel_lag1": 0.34872577478765693,
+    "nonfinite_at": null,
+    "torso_z_end": -0.33997830748558044
+  },
+  "2.0": {
+    "flipflop_amp_first10": 0.03171517699956894,
+    "flipflop_amp_last10": 0.29265536069869996,
+    "qvel_rms_last20": 0.6674627065658569,
+    "qvel_lag1": 0.6243462950263093,
+    "nonfinite_at": null,
+    "torso_z_end": -0.38394859433174133
+  }
+}

@@ -1,0 +1,3 @@
+results/*_rollouts/
+results/*.log
+__pycache__/

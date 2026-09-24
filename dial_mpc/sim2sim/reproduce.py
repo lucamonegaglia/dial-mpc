@@ -135,12 +135,13 @@ def build_context(run_dir: str) -> ReproContext:
     planner = PlannerStepper(planner_env, nominal.sys, sys_fields, nominal.kp, nominal.kd)
     mbdpi = MBDPI(dial_config, planner_env, model_step_fn=planner.step_fn)
     diffuse = DiffuseStepper(mbdpi, dial_config)
+    # both directions, as in sweep.py: an env may default to physical limits
+    planner_env.terminate_on_physical_limits = drc.terminate_on_physical_limits
+    plant_env.terminate_on_physical_limits = drc.terminate_on_physical_limits
     if drc.terminate_on_physical_limits:
-        planner_env.terminate_on_physical_limits = True
-        plant_env.terminate_on_physical_limits = True
         print("Termination: physical joint limits (not the narrower action-scaling band)")
     else:
-        print("Termination: env default (the hand-tuned action-scaling band)")
+        print("Termination: the hand-tuned action-scaling band")
 
     return ReproContext(run_dir, dial_config, mbdpi, stepper, diffuse, planner, specs)
 

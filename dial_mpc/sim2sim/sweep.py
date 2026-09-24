@@ -363,17 +363,19 @@ def main():
     mbdpi = MBDPI(dial_config, planner_env, model_step_fn=planner.step_fn)
     diffuse = DiffuseStepper(mbdpi, dial_config)
 
+    # Assigned in both directions: an env may default to physical limits (LimxTron1WFEnv
+    # does), so leaving the flag untouched when false would silently ignore the yaml.
+    planner_env.terminate_on_physical_limits = drc.terminate_on_physical_limits
+    plant_env.terminate_on_physical_limits = drc.terminate_on_physical_limits
     if drc.terminate_on_physical_limits:
         # This decides when the PLANT's episode ends, which is the whole point. Setting it on
         # the planner env is no longer cosmetic: `rollout_us` still never truncates on `done`,
         # but UnitreeH1LocoEnv now weights `reward_alive` at 1.0 (unitree_h1_env.py:824), so a
         # wider termination band leaves `done` at 0 for longer and the planner scores those
         # sampled rollouts higher. Both envs get the same band so the two arms stay comparable.
-        planner_env.terminate_on_physical_limits = True
-        plant_env.terminate_on_physical_limits = True
         print("Termination: physical joint limits (not the narrower action-scaling band)")
     else:
-        print("Termination: env default (the hand-tuned action-scaling band)")
+        print("Termination: the hand-tuned action-scaling band")
 
     timestamp = time.strftime("%Y%m%d-%H%M%S")
     run_dir = os.path.join(dial_config.output_dir, f"{timestamp}")

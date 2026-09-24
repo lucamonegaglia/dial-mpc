@@ -242,8 +242,8 @@ class UnitreeGo2Env(BaseEnv):
         up = jnp.array([0.0, 0.0, 1.0])
         joint_angles = pipeline_state.q[7:]
         done = jnp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
-        done |= jnp.any(joint_angles < self.joint_range[:, 0])
-        done |= jnp.any(joint_angles > self.joint_range[:, 1])
+        done |= jnp.any(joint_angles < self.termination_joint_range[:, 0])
+        done |= jnp.any(joint_angles > self.termination_joint_range[:, 1])
         done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < 0.18
         done = done.astype(jnp.float32)
 
@@ -499,8 +499,8 @@ class UnitreeGo2SeqJumpEnv(UnitreeGo2Env):
         up = jnp.array([0.0, 0.0, 1.0])
         joint_angles = pipeline_state.q[7:]
         done = jnp.dot(math.rotate(up, x.rot[self._torso_idx - 1]), up) < 0
-        done |= jnp.any(joint_angles < self.joint_range[:, 0])
-        done |= jnp.any(joint_angles > self.joint_range[:, 1])
+        done |= jnp.any(joint_angles < self.termination_joint_range[:, 0])
+        done |= jnp.any(joint_angles > self.termination_joint_range[:, 1])
         done |= pipeline_state.x.pos[self._torso_idx - 1, 2] < 0.1
         done = done.astype(jnp.float32)
 

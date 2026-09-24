@@ -24,6 +24,7 @@ import dial_mpc.envs as dial_envs
 from dial_mpc.utils.io_utils import get_example_path, load_dataclass_from_dict
 from dial_mpc.examples import examples
 from dial_mpc.core.dial_config import DialConfig
+from typing import cast
 
 plt.style.use("science")
 
@@ -38,8 +39,20 @@ def rollout_us(step_env, state, us):
         state = step_env(state, u)
         return state, (state.reward, state.pipeline_state)
 
-    _, (rews, pipline_states) = jax.lax.scan(step, state, us)
-    return rews, pipline_states
+    _, (rews, pipeline_states) = jax.lax.scan(step, state, us)
+    return rews, pipeline_states
+
+
+def rollout_us_model(step_env_model, model, state, us):
+    """Like `rollout_us`, but the physics model is a traced argument rather than a closure
+    constant, so a caller can roll out under arbitrary dynamics without recompiling."""
+
+    def step(state, u):
+        state = step_env_model(model, state, u)
+        return state, (state.reward, state.pipeline_state)
+
+    _, (rews, pipeline_states) = jax.lax.scan(step, state, us)
+    return rews, pipeline_states
 
 
 @jax.jit
@@ -49,7 +62,16 @@ def softmax_update(weights, Y0s, sigma, mu_0t):
 
 
 class MBDPI:
-    def __init__(self, args: DialConfig, env):
+    def __init__(self, args: DialConfig, env, model_step_fn=None):
+        """`model_step_fn`, if given, is a `step(model, state, action) -> state` whose
+        physics model arrives as a traced argument. Supplying it enables the optional
+        `reverse_once(..., model=...)` path; leaving it None keeps this class exactly as
+        it was, with the env's model baked in as a closure constant.
+
+        The function itself is fixed for the env's lifetime, so passing it here is safe
+        even though `reverse_once` is jitted with `self` static (and hashed by identity).
+        Only the model *values* vary per call, and those travel as a real argument.
+        """
         self.args = args
         self.env = env
         self.nu = env.action_size
@@ -79,6 +101,18 @@ class MBDPI:
         # setup function
         self.rollout_us = jax.jit(functools.partial(rollout_us, self.env.step))
         self.rollout_us_vmap = jax.jit(jax.vmap(self.rollout_us, in_axes=(None, 0)))
+        # Optional model-as-argument variant. `in_axes=(None, None, 0)` broadcasts the
+        # model and the state and maps over the Nsample control-sequence batch, so the
+        # model is stored once, not replicated per sample.
+        self.model_step_fn = model_step_fn
+        self.rollout_us_model_vmap = None
+        if model_step_fn is not None:
+            self.rollout_us_model = jax.jit(
+                functools.partial(rollout_us_model, model_step_fn)
+            )
+            self.rollout_us_model_vmap = jax.jit(
+                jax.vmap(self.rollout_us_model, in_axes=(None, None, 0))
+            )
         self.node2u_vmap = jax.jit(
             jax.vmap(self.node2u, in_axes=(1), out_axes=(1))
         )  # process (horizon, node)
@@ -101,7 +135,7 @@ class MBDPI:
         return nodes
 
     @functools.partial(jax.jit, static_argnums=(0,))
-    def reverse_once(self, state, rng, Ybar_i, noise_scale):
+    def reverse_once(self, state, rng, Ybar_i, noise_scale, model=None):
         # sample from q_i
         rng, Y0s_rng = jax.random.split(rng)
         eps_Y = jax.random.normal(
@@ -117,25 +151,84 @@ class MBDPI:
         us = self.node2u_vvmap(Y0s)
 
         # esitimate mu_0tm1
-        rewss, pipeline_statess = self.rollout_us_vmap(state, us)
-        rew_Ybar_i = rewss[-1].mean()
+        # `model is None` is a trace-time Python test, so the two branches compile to
+        # separate cache entries and never interfere. A 4-argument call -- which is what
+        # all pre-existing callers make -- takes the original path unchanged.
+        if model is None:
+            rewss, pipeline_statess = self.rollout_us_vmap(state, us)
+        else:
+            if self.rollout_us_model_vmap is None:
+                raise RuntimeError(
+                    "reverse_once(..., model=...) requires MBDPI(..., model_step_fn=...)"
+                )
+            rewss, pipeline_statess = self.rollout_us_model_vmap(model, state, us)
         qss = pipeline_statess.q
         qdss = pipeline_statess.qd
         xss = pipeline_statess.x.pos
         rews = rewss.mean(axis=-1)
-        logp0 = (rews - rew_Ybar_i) / rews.std(axis=-1) / self.args.temp_sample
+
+        # Reject diverged samples before they poison the update. Two distinct failures:
+        # a non-finite reward makes `rews.std()` NaN
+        # a huge-but-*finite* one inflates std to ~1e16, flattens every logp0 to 0 and makes softmax
+        # uniform (ESS == Nsample).        
+        # So: mask non-finite, and estimate the scale on a trimmed core so outliers cannot
+        # move it. Trimming affects the scale only, never the ranking.
+        finite = jnp.isfinite(rews) & (rews >= -1e5) & (rews <= 1e5)
+        TRIM = 0.02
+        # nanquantile, not quantile-over-a-+inf-filled copy: with the latter, once more
+        # than TRIM of the samples diverge the 1-TRIM quantile IS +inf, so the upper tail
+        # stops being trimmed at exactly the divergence rates where trimming matters most
+        # (and below that rate the +inf entries still occupy slots in the upper tail, so
+        # fewer than TRIM of the finite samples get excluded). nanquantile drops the
+        # non-finite entries from the population instead, so TRIM always means TRIM of
+        # the surviving samples.
+        rews_in = cast(jnp.ndarray, jnp.where(finite, rews, jnp.nan))
+        inlier = finite & (rews >= jnp.nanquantile(rews_in, TRIM)) & (
+            rews <= jnp.nanquantile(rews_in, 1.0 - TRIM)
+        )
+        n_in = jnp.maximum(inlier.sum(), 1)
+        mu = jnp.where(inlier, rews, 0.0).sum() / n_in
+        dev = jnp.where(inlier, rews - mu, 0.0)  # mask before squaring: -6e32 overflows f32
+        std = jnp.sqrt((dev * dev).sum() / n_in)
+        std = jnp.where(std > 0.0, std, 1.0)  # also guards the all-equal-rewards case
+
+        rews_safe = jnp.where(finite, rews, mu)
+        # Centring on `mu` instead of the incumbent's own reward is a no-op (softmax is
+        # shift-invariant) but keeps logits near zero when the incumbent is what blew up.
+        logp0 = (rews_safe - mu) / std / self.args.temp_sample
+        logp0 = jnp.where(finite, logp0, -jnp.inf)  # diverged samples get zero weight
+        logp0 = jnp.where(finite.any(), logp0, 0.0)  # all diverged -> uniform, not all-NaN
 
         weights = jax.nn.softmax(logp0)
-        Ybar, new_noise_scale = self.update_fn(weights, Y0s, noise_scale, Ybar_i)
+        # Zero weights are not enough: 0 * NaN is NaN, so the diverged samples' own
+        # trajectories must be zeroed before the weighted means below.
+        keep3 = finite[:, None, None]
+        Y0s_k = jnp.where(keep3, Y0s, 0.0)
+        qss_k = jnp.where(keep3, qss, 0.0)
+        qdss_k = jnp.where(keep3, qdss, 0.0)
+        xss_k = jnp.where(finite[:, None, None, None], xss, 0.0)
+
+        Ybar, new_noise_scale = self.update_fn(weights, Y0s_k, noise_scale, Ybar_i)
 
         # NOTE: update only with reward
-        Ybar = jnp.einsum("n,nij->ij", weights, Y0s)
-        qbar = jnp.einsum("n,nij->ij", weights, qss)
-        qdbar = jnp.einsum("n,nij->ij", weights, qdss)
-        xbar = jnp.einsum("n,nijk->ijk", weights, xss)
+        Ybar = jnp.einsum("n,nij->ij", weights, Y0s_k)
+        qbar = jnp.einsum("n,nij->ij", weights, qss_k)
+        qdbar = jnp.einsum("n,nij->ij", weights, qdss_k)
+        xbar = jnp.einsum("n,nijk->ijk", weights, xss_k)
 
         info = {
-            "rews": rews,
+            # censored, not raw: a single diverged sample would otherwise make every
+            # downstream mean of this NaN.
+            "rews": rews_safe,
+            # The return the planner actually expects from the plan it just committed to.
+            # `rews_safe.mean()` is NOT that: it averages the whole deliberately-perturbed
+            # sample cloud, so one near-diverging-but-finite sample dominates it.
+            "rew_plan": jnp.dot(weights, rews_safe),
+            "frac_diverged": 1.0 - finite.mean(),
+            "frac_trimmed": 1.0 - inlier.mean(),  # excluded from the scale estimate only
+            "plan_std": std,
+            # ESS ~= 1 is greedy; ESS ~= Nsample means the update was uniform, i.e. degenerate.
+            "ess": 1.0 / jnp.sum(weights ** 2),
             "qbar": qbar,
             "qdbar": qdbar,
             "xbar": xbar,

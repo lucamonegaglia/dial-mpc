@@ -173,7 +173,7 @@ class MBDPI:
         # uniform (ESS == Nsample).        
         # So: mask non-finite, and estimate the scale on a trimmed core so outliers cannot
         # move it. Trimming affects the scale only, never the ranking.
-        finite = jnp.isfinite(rews)
+        finite = jnp.isfinite(rews) & (rews >= -1e5) & (rews <= 1e5)
         TRIM = 0.02
         # nanquantile, not quantile-over-a-+inf-filled copy: with the latter, once more
         # than TRIM of the samples diverge the 1-TRIM quantile IS +inf, so the upper tail

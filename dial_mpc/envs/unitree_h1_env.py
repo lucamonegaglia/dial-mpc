@@ -821,7 +821,7 @@ class UnitreeH1LocoEnv(BaseEnv):
             + reward_height * 0.5
             + reward_foot_level * 0.02
             + reward_energy * 0.01
-            + reward_alive * 0.0
+            + reward_alive * 1.0
         )
 
         # done

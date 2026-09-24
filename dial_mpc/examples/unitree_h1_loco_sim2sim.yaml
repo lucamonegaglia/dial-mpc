@@ -45,6 +45,7 @@ domain_randomization:
   save_rollouts: false  # dump EVERY trial's state log; the most divergent trials are
                         # always saved under interesting/ regardless of this flag
   n_interesting: 12     # how many divergent trial pairs to save state logs for
+  terminate_on_physical_limits: false
   params:
     # +/-20% of torso_link mass (nominal 24.457 kg)
     torso_mass:

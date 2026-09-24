@@ -253,3 +253,4 @@ AMENT_IGNORE
 
 dial_mpc_ws/
 sim2sim_results
+output

@@ -1,7 +1,7 @@
 # DIAL-MPC
 seed: 0
-output_dir: limx_tron1_wf_walk
-n_steps: 400
+output_dir: output/limx_tron1_wf_walk
+n_steps: 2000
 
 env_name: limx_tron1_wf_walk
 Nsample: 2048
@@ -26,7 +26,7 @@ action_scale: 1.0
 kp: [120.0, 120.0, 120.0, 0.0, 120.0, 120.0, 120.0, 0.0]
 kd: [5.0, 5.0, 5.0, 0.8, 5.0, 5.0, 5.0, 0.8]
 max_wheel_vel: 20.0
-default_vx: 1.0
+default_vx: 0.0
 default_vy: 0.0
 default_vyaw: 0.0
 ramp_up_time: 1.0

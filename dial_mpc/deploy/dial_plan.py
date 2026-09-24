@@ -48,7 +48,8 @@ def pipeline_init(
     qd: jax.Array,
 ) -> MjxState:
     data = mjx.make_data(sys)
-    data = data.replace(qpos=q, qvel=qd)
+    data = data.replace(qpos=jnp.asarray(q), qvel=jnp.asarray(qd))
+    data = mjx.forward(sys, data)
 
     q, qd = data.qpos, data.qvel
     x = Transform(pos=data.xpos[1:], rot=data.xquat[1:])
@@ -57,8 +58,10 @@ def pipeline_init(
     offset = Transform.create(pos=offset)
     xd = offset.vmap().do(cvel)
 
-    data = _reformat_contact(sys, data)
-    return MjxState(q=q, qd=qd, x=x, xd=xd, **data.__dict__)
+    brax_contact = _reformat_contact(sys, data.contact)
+    data_args = data.__dict__
+    data_args["contact"] = brax_contact
+    return MjxState(q=q, qd=qd, x=x, xd=xd, **data_args)
 
 
 class MBDPublisher:

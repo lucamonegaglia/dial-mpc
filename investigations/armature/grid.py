@@ -32,6 +32,8 @@ def main():
                    help="terminate on physical joint limits instead of the action-scaling band")
     p.add_argument("--implicit-damping", action="store_true",
                    help="fold kd into dof_damping and enable eulerdamp (stable 20 ms Euler at low armature)")
+    p.add_argument("--timestep", type=float, default=None,
+                   help="physics substep; dt stays 0.02 so torque is held over dt/timestep substeps")
     p.add_argument("--repeat", type=int, default=1,
                    help="run each cell this many times (measures run-to-run GPU nondeterminism)")
     args = p.parse_args()
@@ -50,7 +52,11 @@ def main():
             for r in csv.DictReader(f):
                 done.add((float(r["plant"]), r["planner_arg"], int(r["seed"]), int(r["rep"])))
 
-    overrides = {"n_steps": args.n_steps} if args.n_steps else None
+    overrides = {}
+    if args.n_steps:
+        overrides["n_steps"] = args.n_steps
+    if args.timestep:
+        overrides["timestep"] = args.timestep
     h = build(overrides, phys_term=args.phys_term, implicit_damping=args.implicit_damping)
     fields = ["plant", "planner", "planner_arg", "seed", "rep", "wall_s"] + RESULT_KEYS
     new_file = not os.path.exists(csv_path)

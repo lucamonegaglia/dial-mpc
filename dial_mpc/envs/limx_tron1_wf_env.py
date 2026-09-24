@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, List, Sequence, Union
 
 import numpy as np
@@ -23,10 +23,17 @@ from dial_mpc.utils.io_utils import get_model_path
 
 @dataclass
 class LimxTron1WFEnvConfig(BaseEnvConfig):
-    kp: Union[float, jax.Array] = 120.0
-    kd: Union[float, jax.Array] = 5.0
-    # wheels are velocity-controlled: tau = wheel_kd * (w_target - w)
-    wheel_kd: float = 0.8
+    # Per-actuator gains (abad_L, hip_L, knee_L, wheel_L, abad_R, hip_R, knee_R, wheel_R) of one
+    # PD law, tau = kp * (q_tar - q) + kd * (qd_tar - qd). Legs hold a position (qd_tar = 0);
+    # wheels have no position target (kp = 0) and track a velocity, so their kd is the wheel
+    # velocity gain. Replaces the scalar kp/kd + `wheel_kd` of 40f9164: the sim2sim harness
+    # randomizes kp/kd as vectors, and folding the wheel gain into kd lets that reach the wheels.
+    kp: Union[float, jax.Array] = field(default_factory=lambda: jnp.array(
+        [120.0, 120.0, 120.0, 0.0, 120.0, 120.0, 120.0, 0.0]
+    ))
+    kd: Union[float, jax.Array] = field(default_factory=lambda: jnp.array(
+        [5.0, 5.0, 5.0, 0.8, 5.0, 5.0, 5.0, 0.8]
+    ))
     max_wheel_vel: float = 20.0
     default_vx: float = 1.0
     default_vy: float = 0.0
@@ -65,9 +72,10 @@ class LimxTron1WFEnv(BaseEnv):
         self._default_pose = jnp.array(self.sys.mj_model.keyframe("home").qpos[7:])
         self._default_leg_pose = self._default_pose[self._leg_idx]
 
-        # physical limits of the 6 leg joints only; the wheel rows of physical_joint_range are
-        # meaningless (continuous joints) and must never reach a clip or a termination check.
-        self._leg_phys_range = self.physical_joint_range[self._leg_idx]
+        # Terminate on the physical leg limits by default: the action band below is tight
+        # enough that ordinary tracking error leaves it. `_leg_phys_range` is a property, not
+        # a snapshot, because the sim2sim model swap rewrites physical_joint_range.
+        self.terminate_on_physical_limits = True
         # Action sampling range: home pose +/- a per-joint half width (abad, hip, knee),
         # clipped to the physical limits. It must stay centred on the home pose so that a
         # zero action holds the nominal stance instead of yanking the legs off it.
@@ -90,6 +98,18 @@ class LimxTron1WFEnv(BaseEnv):
         ]
         assert not any(id_ == -1 for id_ in wheel_site_id), "Site not found."
         self._wheel_site_id = jnp.array(wheel_site_id)
+
+    @property
+    def _leg_phys_range(self) -> jax.Array:
+        """Physical limits of the 6 leg joints; the wheel rows are meaningless (continuous)."""
+        return self.physical_joint_range[self._leg_idx]
+
+    @property
+    def termination_joint_range(self) -> jax.Array:
+        """Leg-only, since `joint_range` is leg-only and the wheels rotate without bound."""
+        if self.terminate_on_physical_limits:
+            return self._leg_phys_range
+        return self.joint_range
 
     def make_system(self, config: LimxTron1WFEnvConfig) -> System:
         model_path = get_model_path("limx_tron1_wf", "mjx_scene_tron1_wf.xml")
@@ -125,21 +145,10 @@ class LimxTron1WFEnv(BaseEnv):
         q = pipline_state.qpos[7:]
         qd = pipline_state.qvel[6:]
 
-        joint_target = self.act2joint(act)
-        tau_leg = self._config.kp * (
-            joint_target - q[self._leg_idx]
-        ) - self._config.kd * qd[self._leg_idx]
-        tau_wheel = self._config.wheel_kd * (
-            self.act2wheelvel(act) - qd[self._wheel_idx]
-        )
-
-        tau = (
-            jnp.zeros(self.sys.nu)
-            .at[self._leg_idx]
-            .set(tau_leg)
-            .at[self._wheel_idx]
-            .set(tau_wheel)
-        )
+        # wheels: q_tar = q (no position error), legs: qd_tar = 0
+        q_tar = q.at[self._leg_idx].set(self.act2joint(act))
+        qd_tar = jnp.zeros_like(qd).at[self._wheel_idx].set(self.act2wheelvel(act))
+        tau = self._config.kp * (q_tar - q) + self._config.kd * (qd_tar - qd)
         tau = jnp.clip(tau, self.joint_torque_range[:, 0], self.joint_torque_range[:, 1])
         return tau
 
@@ -226,6 +235,7 @@ class LimxTron1WFEnv(BaseEnv):
         reward_pose = -jnp.sum(
             jnp.square(joint_angles[self._leg_idx] - self._default_leg_pose)
         )
+        reward_alive = 1.0 - state.done
         # energy
         reward_energy = -jnp.sum(
             jnp.maximum(ctrl * pipeline_state.qvel[6:] / 160.0, 0.0) ** 2
@@ -239,14 +249,15 @@ class LimxTron1WFEnv(BaseEnv):
             + reward_yaw * 0.3
             + reward_pose * 0.2
             + reward_energy * 0.01
+            + reward_alive * 1.0
         )
 
         # done. Wheel DOFs are excluded from the range check: they rotate without bound.
         up = jnp.array([0.0, 0.0, 1.0])
         leg_angles = joint_angles[self._leg_idx]
         done = jnp.dot(math.rotate(up, x.rot[torso_idx]), up) < 0
-        done |= jnp.any(leg_angles < self._leg_phys_range[:, 0])
-        done |= jnp.any(leg_angles > self._leg_phys_range[:, 1])
+        done |= jnp.any(leg_angles < self.termination_joint_range[:, 0])
+        done |= jnp.any(leg_angles > self.termination_joint_range[:, 1])
         done |= x.pos[torso_idx, 2] < 0.35
         done = done.astype(jnp.float32)
 

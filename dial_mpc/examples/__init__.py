@@ -8,6 +8,7 @@ examples = [
     "unitree_go2_crate_climb",
     "allegro_reorient",
     "limx_tron1_wf_walk",
+    "limx_tron1_wf_walk_sim2sim",
 ]
 
 deploy_examples = [

@@ -21,9 +21,10 @@ leg_control: torque
 action_scale: 1.0
 
 # Tron1 wheeled-foot
-kp: 120.0
-kd: 5.0
-wheel_kd: 0.8
+# per actuator: abad_L, hip_L, knee_L, wheel_L, abad_R, hip_R, knee_R, wheel_R
+# wheels: kp = 0 (no position target), kd = wheel velocity gain
+kp: [120.0, 120.0, 120.0, 0.0, 120.0, 120.0, 120.0, 0.0]
+kd: [5.0, 5.0, 5.0, 0.8, 5.0, 5.0, 5.0, 0.8]
 max_wheel_vel: 20.0
 default_vx: 1.0
 default_vy: 0.0

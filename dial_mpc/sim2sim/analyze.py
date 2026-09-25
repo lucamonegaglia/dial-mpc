@@ -281,7 +281,9 @@ def _binned_delta(x: np.ndarray, y: np.ndarray, n_bins: int = 5, n_boot: int = 2
 
 
 def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float, label: str,
-                        out_path: str):
+                        out_path: str, n_paired: int, n_elements: Dict[str, int], x_note: str):
+    """`n_elements[name] > 1` marks a panel whose x is a mean over that many elements; it is
+    drawn in orange with the count in its x label. `x_note` explains what x is."""
     order = sorted(stats, key=lambda k: -np.ptp([b["mean"] for b in stats[k]]))
     n = len(order)
     ncols = min(5, n)
@@ -301,13 +303,15 @@ def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float
                 ax.axvspan(b["x_lo"], b["x_hi"], color=_GRID, alpha=0.6, linewidth=0, zorder=0)
         ax.axhline(0.0, color=_BASELINE, linewidth=1.2, zorder=1)
         ax.axhline(overall, color=_INK_MUTED, linewidth=1.0, linestyle=(0, (3, 2)), zorder=1)
+        k_el = n_elements.get(name, 1)
+        color = _ORANGE if k_el > 1 else _BLUE
         ax.vlines(xm, lo, hi, color=_INK_SECONDARY, linewidth=1.4, zorder=2)
-        ax.plot(xm, mean, color=_BLUE, linewidth=2.0, zorder=3)
-        ax.scatter(xm, mean, s=40, color=_BLUE, edgecolors=_SURFACE, linewidths=1.5, zorder=4)
+        ax.plot(xm, mean, color=color, linewidth=2.0, zorder=3)
+        ax.scatter(xm, mean, s=40, color=color, edgecolors=_SURFACE, linewidths=1.5, zorder=4)
         _style_axes(ax)
         ax.tick_params(labelsize=8)
         ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
-        ax.set_xlabel(name, fontsize=9)
+        ax.set_xlabel(f"{name}  (mean of {k_el})" if k_el > 1 else name, fontsize=9)
         ax.set_title(f"spread {np.ptp(mean):.0f}", fontsize=8.5, color=_INK_SECONDARY, loc="left")
         if i % ncols == 0:
             ax.set_ylabel(label, fontsize=9)
@@ -315,20 +319,20 @@ def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float
         axes[j // ncols][j % ncols].axis("off")
 
     subtitle = textwrap.fill(
-        f"Bins: per panel, "
-        f"trials are sorted by the plant's sampled value of that parameter (mean over elements for "
-        f"per-element axes) and split into {len(stats[order[0]])} equal-count bins of "
-        f"~{int(stats[order[0]][0]['n'])} trials; shaded bands alternate to show each bin's value "
-        f"range. Points: mean Δ in the bin at the bin's median value; vertical lines: bootstrap 95% "
-        f"CI. Solid line: Δ = 0; dashed: mean over all trials ({overall:.1f}). Below 0 = the "
-        f"true-parameter planner did better. Panels ranked by spread (max − min of the bin means). "
+        f"{x_note} Bins: per panel, "
+        f"trials are sorted by the plant's sampled value of x and split into "
+        f"{len(stats[order[0]])} equal-count bins of "
+        f"~{int(stats[order[0]][0]['n'])} trials; shaded bands show each bin's value "
+        f"range. Points: y: mean Δ in the bin, x: bin's median value. Vertical lines: bootstrap 95% "
+        f"CI. Dashed line: mean Δ over all trials ({overall:.1f}). "
+        f"Panels ranked by spread (max − min of the bin means). "
         f"Same plant and MPC seed in both arms; only the planner's model differs.",
         width=int(26 * ncols))
     n_lines = subtitle.count("\n") + 1
     fig_h = fig.get_figheight()
-    fig.suptitle(f"How the planner's model error varies with each parameter   "
-                 f"{label} = nominal-planner − true-planner"
-                 f"{n} paired trials)",
+    fig.suptitle(f"How the planner's model error varies with each parameter,   "
+                 f"{label} = nominal-planner − true-planner,    "
+                 f"n = {n_paired} paired trials",
                  color=_INK, fontsize=12, x=0.010, y=1 - 0.12 / fig_h, ha="left", va="top")
     fig.text(0.010, 1 - 0.45 / fig_h, subtitle, fontsize=8.5, color=_INK_SECONDARY,
              ha="left", va="top")
@@ -339,12 +343,13 @@ def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float
 
 def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_dir: str,
                             csv_path: str):
-    """Raw paired delta by parameter quintile, one small multiple per randomization axis.
+    """Raw paired Δ total reward by parameter quintile, as two small-multiple figures.
 
-    Written for both total reward and steps survived: total reward folds in tracking
-    quality and uptime (the env weights `reward_alive` at 1.0), steps-survived isolates
-    uptime. Replaces the earlier per-1-SD OLS slope summary (commit 6cabdd6), whose
-    sign was routinely misread as the sign of the delta itself.
+    `sensitivity_summary_aggregated.png` has one panel per randomization axis, per-element
+    axes averaged over their elements; `sensitivity_summary_per_element.png` has one panel
+    per sampled column. Replaces the earlier per-1-SD OLS slope summary (commit 6cabdd6);
+    the `_return`/`_steps` pair of commit 2c3f485 is gone (steps survived dropped, `_return`
+    renamed `_aggregated`), and sensitivity.csv gains a `view` column instead of `response`.
     """
     by_trial: Dict[int, Dict[str, Dict]] = {}
     for r in rows:
@@ -353,35 +358,45 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_dir: st
     if len(paired) < 10:
         return
 
-    groups = _spec_groups([c for c in theta_cols
-                           if all(d[GROUP_NOMINAL_PLANNER].get(c) is not None for d in paired)])
+    cols_ok = [c for c in theta_cols if all(d[GROUP_NOMINAL_PLANNER].get(c) is not None for d in paired)]
+    groups = _spec_groups(cols_ok)
     if not groups:
         return
 
-    responses = {
-        "return": ("Δ total reward", "return_sum"),
-        "steps": ("Δ steps survived", "steps_survived"),
+    label = "Δ total reward"
+    delta = np.array([d[GROUP_NOMINAL_PLANNER]["return_sum"] - d[GROUP_TRUE_PLANNER]["return_sum"]
+                      for d in paired])
+    overall = float(np.nanmean(delta))
+    views = {
+        "aggregated": (
+            groups, {name: len(cols) for name, cols in groups.items()},
+            "x: the parameter's sampled value; orange panels are per-element parameters, "
+            "x = mean over their N independently drawn elements (N in the axis label)."),
+        "per_element": (
+            {c: [c] for c in cols_ok}, {},
+            "x: one sampled column each; `<name>_<i>` is element i of a per-element parameter "
+            "(actuated joints: abad/hip/knee/wheel L, then R), `<name>_<i>_<j>` is component j "
+            "of element i (com_offset_0_j: x/y/z). Constant columns are omitted."),
     }
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["parameter", "response", "bin", "x_lo", "x_hi", "x_median", "n_trials",
+        w.writerow(["view", "parameter", "bin", "x_lo", "x_hi", "x_median", "n_trials",
                     "mean_delta", "ci_lo", "ci_hi"])
-        for key, (label, field) in responses.items():
-            delta = np.array([d[GROUP_NOMINAL_PLANNER][field] - d[GROUP_TRUE_PLANNER][field]
-                              for d in paired])
+        for view, (col_groups, n_elements, x_note) in views.items():
             stats = {}
-            for name, cols in groups.items():
+            for name, cols in col_groups.items():
                 x = np.array([_group_value(d[GROUP_NOMINAL_PLANNER], cols) for d in paired])
                 bins = _binned_delta(x, delta)
                 if bins:
                     stats[name] = bins
             if not stats:
                 continue
-            _plot_binned_panels(stats, float(np.nanmean(delta)), label,
-                                os.path.join(out_dir, f"sensitivity_summary_{key}.png"))
+            _plot_binned_panels(stats, overall, label,
+                                os.path.join(out_dir, f"sensitivity_summary_{view}.png"),
+                                len(paired), n_elements, x_note)
             for name, bins in stats.items():
                 for i, b in enumerate(bins):
-                    w.writerow([name, key, i, f"{b['x_lo']:.6g}", f"{b['x_hi']:.6g}",
+                    w.writerow([view, name, i, f"{b['x_lo']:.6g}", f"{b['x_hi']:.6g}",
                                 f"{b['x_med']:.6g}", int(b["n"]), f"{b['mean']:.6g}",
                                 f"{b['lo']:.6g}", f"{b['hi']:.6g}"])
 

@@ -283,7 +283,7 @@ def _binned_delta(x: np.ndarray, y: np.ndarray, n_bins: int = 5, n_boot: int = 2
 def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float, label: str,
                         out_path: str, n_paired: int, n_elements: Dict[str, int], x_note: str):
     """`n_elements[name] > 1` marks a panel whose x is a mean over that many elements; it is
-    drawn in orange with the count in its x label. `x_note` explains what x is."""
+    labelled in orange with the count in its x label. `x_note` explains what x is."""
     order = sorted(stats, key=lambda k: -np.ptp([b["mean"] for b in stats[k]]))
     n = len(order)
     ncols = min(5, n)
@@ -303,15 +303,17 @@ def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float
                 ax.axvspan(b["x_lo"], b["x_hi"], color=_GRID, alpha=0.6, linewidth=0, zorder=0)
         ax.axhline(0.0, color=_BASELINE, linewidth=1.2, zorder=1)
         ax.axhline(overall, color=_INK_MUTED, linewidth=1.0, linestyle=(0, (3, 2)), zorder=1)
-        k_el = n_elements.get(name, 1)
-        color = _ORANGE if k_el > 1 else _BLUE
         ax.vlines(xm, lo, hi, color=_INK_SECONDARY, linewidth=1.4, zorder=2)
-        ax.plot(xm, mean, color=color, linewidth=2.0, zorder=3)
-        ax.scatter(xm, mean, s=40, color=color, edgecolors=_SURFACE, linewidths=1.5, zorder=4)
+        ax.plot(xm, mean, color=_BLUE, linewidth=2.0, zorder=3)
+        ax.scatter(xm, mean, s=40, color=_BLUE, edgecolors=_SURFACE, linewidths=1.5, zorder=4)
         _style_axes(ax)
         ax.tick_params(labelsize=8)
         ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
-        ax.set_xlabel(f"{name}  (mean of {k_el})" if k_el > 1 else name, fontsize=9)
+        k_el = n_elements.get(name, 1)
+        if k_el > 1:
+            ax.set_xlabel(f"{name}  (mean of {k_el})", fontsize=9, color=_ORANGE)
+        else:
+            ax.set_xlabel(name, fontsize=9)
         ax.set_title(f"spread {np.ptp(mean):.0f}", fontsize=8.5, color=_INK_SECONDARY, loc="left")
         if i % ncols == 0:
             ax.set_ylabel(label, fontsize=9)
@@ -370,7 +372,7 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_dir: st
     views = {
         "aggregated": (
             groups, {name: len(cols) for name, cols in groups.items()},
-            "x: the parameter's sampled value; orange panels are per-element parameters, "
+            "x: the parameter's sampled value; orange names are per-element parameters, "
             "x = mean over their N independently drawn elements (N in the axis label)."),
         "per_element": (
             {c: [c] for c in cols_ok}, {},

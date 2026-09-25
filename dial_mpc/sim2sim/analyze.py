@@ -254,59 +254,95 @@ def _group_value(row: Dict, cols: List[str]) -> float:
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def _standardized_effect(x: np.ndarray, y: np.ndarray, n_boot: int = 2000,
-                         seed: int = 0) -> Dict[str, float]:
-    """OLS slope of y on x, expressed per 1 SD of x, with a bootstrap 95% interval.
+def _binned_delta(x: np.ndarray, y: np.ndarray, n_bins: int = 5, n_boot: int = 2000,
+                  seed: int = 0) -> List[Dict[str, float]]:
+    """Mean of y within equal-count quantile bins of x, with a bootstrap 95% CI per bin.
 
-    Standardizing matters because the axes are not in comparable units: `friction` and
-    `limb_mass` are dimensionless scale factors, `com_offset` is metres, `damping` is
-    log-uniform. A raw slope would make the metre-scale axis look negligible purely
-    because its numbers are small. "Effect per 1 SD of the sampled range" puts every
-    axis on the same footing: how much does the metric move across the spread this
-    sweep actually explored?
+    Reports the raw paired delta where it happens rather than a linear slope: a slope
+    hides the level (a large constant gap gives slope 0) and folds a V-shaped response
+    (mismatch hurting on both sides of nominal) into a misleading single sign.
     """
     ok = np.isfinite(x) & np.isfinite(y)
     x, y = x[ok], y[ok]
-    if len(x) < 8 or np.std(x) == 0:
-        return {"beta": float("nan"), "lo": float("nan"), "hi": float("nan"),
-                "spearman": float("nan"), "n": float(len(x))}
-    sd = float(np.std(x))
-    slope = float(np.polyfit(x, y, 1)[0])
+    if len(x) < 2 * n_bins or np.ptp(x) == 0:
+        return []
+    order = np.argsort(x, kind="stable")
     rng = np.random.default_rng(seed)
-    boot = np.empty(n_boot)
-    n = len(x)
-    for b in range(n_boot):
-        idx = rng.integers(0, n, n)
+    bins = []
+    for idx in np.array_split(order, n_bins):
         xb, yb = x[idx], y[idx]
-        boot[b] = np.polyfit(xb, yb, 1)[0] * np.std(xb) if np.std(xb) > 0 else np.nan
-    boot = boot[np.isfinite(boot)]
-    rx = np.argsort(np.argsort(x))
-    ry = np.argsort(np.argsort(y))
-    rho = float(np.corrcoef(rx, ry)[0, 1]) if np.std(rx) > 0 and np.std(ry) > 0 else float("nan")
-    return {
-        "beta": slope * sd,
-        "lo": float(np.percentile(boot, 2.5)) if boot.size else float("nan"),
-        "hi": float(np.percentile(boot, 97.5)) if boot.size else float("nan"),
-        "spearman": rho,
-        "n": float(n),
-    }
+        boot = rng.choice(yb, size=(n_boot, len(yb)), replace=True).mean(axis=1)
+        bins.append({
+            "x_lo": float(xb.min()), "x_hi": float(xb.max()), "x_med": float(np.median(xb)),
+            "n": float(len(yb)), "mean": float(yb.mean()),
+            "lo": float(np.percentile(boot, 2.5)), "hi": float(np.percentile(boot, 97.5)),
+        })
+    return bins
 
 
-def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_path: str,
+def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float, label: str,
+                        out_path: str):
+    order = sorted(stats, key=lambda k: -np.ptp([b["mean"] for b in stats[k]]))
+    n = len(order)
+    ncols = min(5, n)
+    nrows = -(-n // ncols)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(2.6 * ncols, 2.5 * nrows + 1.0), dpi=150,
+                             sharey=True, squeeze=False)
+    fig.patch.set_facecolor(_SURFACE)
+    for i, name in enumerate(order):
+        ax = axes[i // ncols][i % ncols]
+        bins = stats[name]
+        xm = np.array([b["x_med"] for b in bins])
+        mean = np.array([b["mean"] for b in bins])
+        lo = np.array([b["lo"] for b in bins])
+        hi = np.array([b["hi"] for b in bins])
+        ax.axhline(0.0, color=_BASELINE, linewidth=1.2, zorder=1)
+        ax.axhline(overall, color=_INK_MUTED, linewidth=1.0, linestyle=(0, (3, 2)), zorder=1)
+        ax.vlines(xm, lo, hi, color=_INK_SECONDARY, linewidth=1.4, zorder=2)
+        ax.plot(xm, mean, color=_BLUE, linewidth=2.0, zorder=3)
+        ax.scatter(xm, mean, s=40, color=_BLUE, edgecolors=_SURFACE, linewidths=1.5, zorder=4)
+        _style_axes(ax)
+        ax.tick_params(labelsize=8)
+        ax.xaxis.set_major_locator(MaxNLocator(nbins=4))
+        ax.set_xlabel(name, fontsize=9)
+        ax.set_title(f"spread {np.ptp(mean):.0f}", fontsize=8.5, color=_INK_SECONDARY, loc="left")
+        if i % ncols == 0:
+            ax.set_ylabel(label, fontsize=9)
+    for j in range(n, nrows * ncols):
+        axes[j // ncols][j % ncols].axis("off")
+
+    subtitle = textwrap.fill(
+        f"Same plant and MPC seed in both arms; only the planner's model differs. Points: mean Δ "
+        f"in each parameter quintile (x = bin median); lines: bootstrap 95% CI. Solid line: Δ = 0; "
+        f"dashed: mean over all trials ({overall:.1f}). Below 0 = the true-parameter planner did "
+        f"better. Panels ranked by spread (max − min of the bin means).",
+        width=int(26 * ncols))
+    n_lines = subtitle.count("\n") + 1
+    fig_h = fig.get_figheight()
+    fig.suptitle(f"How the planner's model error varies with each parameter   "
+                 f"{label} = nominal-planner − true-planner",
+                 color=_INK, fontsize=12, x=0.010, y=1 - 0.12 / fig_h, ha="left", va="top")
+    fig.text(0.010, 1 - 0.45 / fig_h, subtitle, fontsize=8.5, color=_INK_SECONDARY,
+             ha="left", va="top")
+    fig.tight_layout(rect=(0, 0, 1, 1 - (0.5 + 0.15 * n_lines) / fig_h))
+    fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")
+    plt.close(fig)
+
+
+def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_dir: str,
                             csv_path: str):
-    """One bar per randomization axis, ranked by how much it moves the paired delta.
+    """Raw paired delta by parameter quintile, one small multiple per randomization axis.
 
-    Two responses side by side because they decompose the same failure differently: total
-    reward folds in both how well the plant tracked and how long it stayed up (the env
-    weights `reward_alive` at 1.0), while steps-survived isolates the survival half. A
-    parameter that shows up in the first but not the second moved tracking quality, not
-    uptime.
+    Written for both total reward and steps survived: total reward folds in tracking
+    quality and uptime (the env weights `reward_alive` at 1.0), steps-survived isolates
+    uptime. Replaces the earlier per-1-SD OLS slope summary (commit 6cabdd6), whose
+    sign was routinely misread as the sign of the delta itself.
     """
     by_trial: Dict[int, Dict[str, Dict]] = {}
     for r in rows:
         by_trial.setdefault(int(r["trial"]), {})[cast(str, r["group"])] = r
     paired = [d for d in by_trial.values() if GROUP_NOMINAL_PLANNER in d and GROUP_TRUE_PLANNER in d]
-    if len(paired) < 8:
+    if len(paired) < 10:
         return
 
     groups = _spec_groups([c for c in theta_cols
@@ -314,64 +350,32 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_path: s
     if not groups:
         return
 
-    d_ret = np.array([d[GROUP_NOMINAL_PLANNER]["return_sum"] - d[GROUP_TRUE_PLANNER]["return_sum"] for d in paired])
-    d_steps = np.array([d[GROUP_NOMINAL_PLANNER]["steps_survived"] - d[GROUP_TRUE_PLANNER]["steps_survived"] for d in paired])
-
-    stats: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for name, cols in groups.items():
-        x = np.array([_group_value(d[GROUP_NOMINAL_PLANNER], cols) for d in paired])
-        stats[name] = {
-            "return": _standardized_effect(x, d_ret),
-            "steps": _standardized_effect(x, d_steps),
-        }
-
-    order = sorted(stats, key=lambda k: -abs(stats[k]["return"]["beta"]))
-    ypos = np.arange(len(order))[::-1]
-
-    fig, axes = plt.subplots(1, 2, figsize=(11, 0.45 * len(order) + 2.9), dpi=150, sharey=True)
-    fig.patch.set_facecolor(_SURFACE)
-
-    panels = [("return", "Δ total reward", axes[0]), ("steps", "Δ steps survived", axes[1])]
-    for key, label, ax in panels:
-        betas = np.array([stats[k][key]["beta"] for k in order])
-        los = np.array([stats[k][key]["lo"] for k in order])
-        his = np.array([stats[k][key]["hi"] for k in order])
-        colors = [_RED if b < 0 else _BLUE for b in betas]
-        ax.barh(ypos, betas, height=0.6, color=colors, zorder=3)
-        # A bar whose interval crosses zero is not distinguishable from no effect.
-        for yp, b, lo, hi in zip(ypos, betas, los, his):
-            ax.plot([lo, hi], [yp, yp], color=_INK_SECONDARY, linewidth=1.4, zorder=4,
-                    solid_capstyle="butt")
-        ax.axvline(0.0, color=_BASELINE, linewidth=1.2, zorder=2)
-        _style_axes(ax)
-        ax.set_yticks(ypos)
-        ax.set_yticklabels(order, fontsize=9)
-        ax.set_xlabel(f"{label}   per 1 SD of parameter", fontsize=9)
-
-    subtitle = textwrap.fill(
-        "Same plant and MPC seed in both arms; only the planner's model differs. Bars: OLS slope of "
-        "Δ per 1 SD of the sampled range (not Δ itself): < 0 means Δ decreases, i.e. the nominal "
-        "planner does relatively worse, as the parameter increases. Lines: bootstrap 95% CI -- "
-        "crossing 0 means no detected effect.",
-        width=118)
-    n_subtitle_lines = subtitle.count("\n") + 1
-    fig.suptitle("Which model errors hurt the planner most?   Δ = nominal-planner − true-planner",
-                 color=_INK, fontsize=12.5, x=0.010, y=0.985, ha="left")
-    fig.text(0.010, 0.945, subtitle, fontsize=8.5, color=_INK_SECONDARY, ha="left", va="top")
-    top_margin = 0.915 - 0.02 * max(0, n_subtitle_lines - 1)
-    fig.tight_layout(rect=(0, 0, 1, top_margin))
-    fig.savefig(out_path, facecolor=_SURFACE, bbox_inches="tight")
-    plt.close(fig)
-
+    responses = {
+        "return": ("Δ total reward", "return_sum"),
+        "steps": ("Δ steps survived", "steps_survived"),
+    }
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["parameter", "response", "effect_per_1sd", "ci_lo", "ci_hi",
-                    "spearman_rho", "n_trials"])
-        for k in order:
-            for key in ("return", "steps"):
-                st = stats[k][key]
-                w.writerow([k, key, f"{st['beta']:.6g}", f"{st['lo']:.6g}",
-                            f"{st['hi']:.6g}", f"{st['spearman']:.4f}", int(st["n"])])
+        w.writerow(["parameter", "response", "bin", "x_lo", "x_hi", "x_median", "n_trials",
+                    "mean_delta", "ci_lo", "ci_hi"])
+        for key, (label, field) in responses.items():
+            delta = np.array([d[GROUP_NOMINAL_PLANNER][field] - d[GROUP_TRUE_PLANNER][field]
+                              for d in paired])
+            stats = {}
+            for name, cols in groups.items():
+                x = np.array([_group_value(d[GROUP_NOMINAL_PLANNER], cols) for d in paired])
+                bins = _binned_delta(x, delta)
+                if bins:
+                    stats[name] = bins
+            if not stats:
+                continue
+            _plot_binned_panels(stats, float(np.nanmean(delta)), label,
+                                os.path.join(out_dir, f"sensitivity_summary_{key}.png"))
+            for name, bins in stats.items():
+                for i, b in enumerate(bins):
+                    w.writerow([name, key, i, f"{b['x_lo']:.6g}", f"{b['x_hi']:.6g}",
+                                f"{b['x_med']:.6g}", int(b["n"]), f"{b['mean']:.6g}",
+                                f"{b['lo']:.6g}", f"{b['hi']:.6g}"])
 
 
 def main():
@@ -398,11 +402,7 @@ def main():
         theta_cols = _theta_columns(rows, summary.get("theta_columns"))
         fig_paired_delta(rows, os.path.join(fig_dir, "paired_delta_return.png"))
         fig_sensitivity(rows, theta_cols, os.path.join(fig_dir, "sensitivity.png"))
-        fig_sensitivity_summary(
-            rows, theta_cols,
-            os.path.join(fig_dir, "sensitivity_summary.png"),
-            os.path.join(args.run, "sensitivity.csv"),
-        )
+        fig_sensitivity_summary(rows, theta_cols, fig_dir, os.path.join(args.run, "sensitivity.csv"))
     fig_survival(rows, os.path.join(fig_dir, "survival.png"))
 
     if not summary:

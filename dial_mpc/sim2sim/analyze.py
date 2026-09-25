@@ -349,12 +349,13 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_path: s
         ax.set_xlabel(f"{label}   per 1 SD of parameter", fontsize=9)
 
     subtitle = textwrap.fill(
-        "Same plant and MPC seed in both arms; only the planner's model differs. Bars: OLS effect "
-        "per 1 SD of the sampled range. Lines: bootstrap 95% CI -- crossing 0 means no detected "
-        "effect.",
+        "Same plant and MPC seed in both arms; only the planner's model differs. Bars: OLS slope of "
+        "Δ per 1 SD of the sampled range (not Δ itself): < 0 means Δ decreases, i.e. the nominal "
+        "planner does relatively worse, as the parameter increases. Lines: bootstrap 95% CI -- "
+        "crossing 0 means no detected effect.",
         width=118)
     n_subtitle_lines = subtitle.count("\n") + 1
-    fig.suptitle("Which model errors hurt the planner most?",
+    fig.suptitle("Which model errors hurt the planner most?   Δ = nominal-planner − true-planner",
                  color=_INK, fontsize=12.5, x=0.010, y=0.985, ha="left")
     fig.text(0.010, 0.945, subtitle, fontsize=8.5, color=_INK_SECONDARY, ha="left", va="top")
     top_margin = 0.915 - 0.02 * max(0, n_subtitle_lines - 1)

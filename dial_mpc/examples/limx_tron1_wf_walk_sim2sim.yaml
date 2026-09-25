@@ -71,15 +71,16 @@ domain_randomization:
       mode: scale
       range: [0.90, 1.10]
       per_element: true
-    # +/-40% ground friction. Contact friction is the max over the pair, so the floor's
-    # 1.0 (not the wheels' 0.6) is what is actually in effect. Kept as one shared scalar:
-    # per-geom draws would mostly land on geoms whose friction never takes effect.
+    # Sliding friction coefficient mu, absolute, written to every geom (floor included).
+    # MuJoCo uses the max over the contact pair, so setting all geoms to mu makes every
+    # contact use exactly mu (nominal: max(floor 1.0, wheel 0.6) = 1.0). Was mode: scale
+    # up to commit dcdbc25; the effective range [0.6, 1.4] is unchanged.
     friction:
       target: sys
       field: geom_friction
       select: all
       column: 0
-      mode: scale
+      mode: abs
       range: [0.60, 1.40]
     # Joint damping, absolute: the nominal is 0.01, so a scale range would be a dead axis.
     # Negligible against the leg kd (5.0), but up to ~40% of the wheel velocity gain (0.8),
@@ -101,12 +102,13 @@ domain_randomization:
       range: [0.5, 2.0]
       dist: log_uniform
       per_element: true
-    # Wheel hub coulomb friction, absolute N*m (nominal 0.01). dofs 9 and 13 are
-    # wheel_L_Joint / wheel_R_Joint (dof_* fields cannot be selected by joint name).
-    wheel_frictionloss:
+    # Coulomb (dry) joint friction, absolute N*m, independent per joint: gearbox/bearing
+    # stiction. Nominal is 0 on the legs and 0.01 on the wheels. Replaces the wheels-only
+    # `wheel_frictionloss` axis (commit dcdbc25).
+    joint_frictionloss:
       target: sys
       field: dof_frictionloss
-      select: [9, 13]
+      select: actuated
       mode: abs
       range: [0.0, 0.5]
       per_element: true

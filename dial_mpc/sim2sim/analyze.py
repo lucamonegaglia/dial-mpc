@@ -296,6 +296,9 @@ def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float
         mean = np.array([b["mean"] for b in bins])
         lo = np.array([b["lo"] for b in bins])
         hi = np.array([b["hi"] for b in bins])
+        for k, b in enumerate(bins):
+            if k % 2 == 0:
+                ax.axvspan(b["x_lo"], b["x_hi"], color=_GRID, alpha=0.6, linewidth=0, zorder=0)
         ax.axhline(0.0, color=_BASELINE, linewidth=1.2, zorder=1)
         ax.axhline(overall, color=_INK_MUTED, linewidth=1.0, linestyle=(0, (3, 2)), zorder=1)
         ax.vlines(xm, lo, hi, color=_INK_SECONDARY, linewidth=1.4, zorder=2)
@@ -312,10 +315,13 @@ def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float
         axes[j // ncols][j % ncols].axis("off")
 
     subtitle = textwrap.fill(
-        f"Same plant and MPC seed in both arms; only the planner's model differs. Points: mean Δ "
-        f"in each parameter quintile (x = bin median); lines: bootstrap 95% CI. Solid line: Δ = 0; "
-        f"dashed: mean over all trials ({overall:.1f}). Below 0 = the true-parameter planner did "
-        f"better. Panels ranked by spread (max − min of the bin means).",
+        f"Same plant and MPC seed in both arms; only the planner's model differs. Bins: per panel, "
+        f"trials are sorted by the plant's sampled value of that parameter (mean over elements for "
+        f"per-element axes) and split into {len(stats[order[0]])} equal-count bins of "
+        f"~{int(stats[order[0]][0]['n'])} trials; shaded bands alternate to show each bin's value "
+        f"range. Points: mean Δ in the bin at the bin's median value; vertical lines: bootstrap 95% "
+        f"CI. Solid line: Δ = 0; dashed: mean over all trials ({overall:.1f}). Below 0 = the "
+        f"true-parameter planner did better. Panels ranked by spread (max − min of the bin means).",
         width=int(26 * ncols))
     n_lines = subtitle.count("\n") + 1
     fig_h = fig.get_figheight()

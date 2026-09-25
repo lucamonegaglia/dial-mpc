@@ -315,18 +315,20 @@ def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float
         axes[j // ncols][j % ncols].axis("off")
 
     subtitle = textwrap.fill(
-        f"Same plant and MPC seed in both arms; only the planner's model differs. Bins: per panel, "
+        f"Bins: per panel, "
         f"trials are sorted by the plant's sampled value of that parameter (mean over elements for "
         f"per-element axes) and split into {len(stats[order[0]])} equal-count bins of "
         f"~{int(stats[order[0]][0]['n'])} trials; shaded bands alternate to show each bin's value "
         f"range. Points: mean Δ in the bin at the bin's median value; vertical lines: bootstrap 95% "
         f"CI. Solid line: Δ = 0; dashed: mean over all trials ({overall:.1f}). Below 0 = the "
-        f"true-parameter planner did better. Panels ranked by spread (max − min of the bin means).",
+        f"true-parameter planner did better. Panels ranked by spread (max − min of the bin means). "
+        f"Same plant and MPC seed in both arms; only the planner's model differs.",
         width=int(26 * ncols))
     n_lines = subtitle.count("\n") + 1
     fig_h = fig.get_figheight()
     fig.suptitle(f"How the planner's model error varies with each parameter   "
-                 f"{label} = nominal-planner − true-planner",
+                 f"{label} = nominal-planner − true-planner"
+                 f"{n} paired trials)",
                  color=_INK, fontsize=12, x=0.010, y=1 - 0.12 / fig_h, ha="left", va="top")
     fig.text(0.010, 1 - 0.45 / fig_h, subtitle, fontsize=8.5, color=_INK_SECONDARY,
              ha="left", va="top")

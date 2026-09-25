@@ -72,7 +72,8 @@ domain_randomization:
       range: [0.90, 1.10]
       per_element: true
     # +/-40% ground friction. Contact friction is the max over the pair, so the floor's
-    # 1.0 (not the wheels' 0.6) is what is actually in effect.
+    # 1.0 (not the wheels' 0.6) is what is actually in effect. Kept as one shared scalar:
+    # per-geom draws would mostly land on geoms whose friction never takes effect.
     friction:
       target: sys
       field: geom_friction
@@ -82,13 +83,15 @@ domain_randomization:
       range: [0.60, 1.40]
     # Joint damping, absolute: the nominal is 0.01, so a scale range would be a dead axis.
     # Negligible against the leg kd (5.0), but up to ~40% of the wheel velocity gain (0.8),
-    # i.e. unmodelled rolling drag.
+    # i.e. unmodelled rolling drag. Independent per joint; like every other per-element axis,
+    # elements `_0.._7` follow the actuated dof order abad/hip/knee/wheel L, then R.
     damping:
       target: sys
       field: dof_damping
       select: actuated
       mode: abs
       range: [0.0, 0.3]
+      per_element: true
     # 0.5x-2x joint armature (nominal 0.01). Half the wheel's effective inertia (0.0197).
     armature:
       target: sys
@@ -97,6 +100,7 @@ domain_randomization:
       mode: scale
       range: [0.5, 2.0]
       dist: log_uniform
+      per_element: true
     # Wheel hub coulomb friction, absolute N*m (nominal 0.01). dofs 9 and 13 are
     # wheel_L_Joint / wheel_R_Joint (dof_* fields cannot be selected by joint name).
     wheel_frictionloss:
@@ -105,6 +109,7 @@ domain_randomization:
       select: [9, 13]
       mode: abs
       range: [0.0, 0.5]
+      per_element: true
     # +/-2% rolling radius (nominal 0.127 m, i.e. +/-2.5 mm): tyre wear/compression. Maps
     # the same wheel speed to a different ground speed. A larger wheel starts the trial up
     # to 2.5 mm into the floor, since the home keyframe is solved for the nominal radius.
@@ -115,6 +120,7 @@ domain_randomization:
       column: 0
       mode: scale
       range: [0.98, 1.02]
+      per_element: true
     # +/-2cm base center-of-mass offset per axis. The inverted-pendulum balance point sits
     # right under it, so the x offset is the one that matters.
     com_offset:
@@ -124,15 +130,19 @@ domain_randomization:
       mode: add
       range: [-0.02, 0.02]
       per_element: true
-    # controller-gain mismatch: +/-30% of the (8-element) kp/kd gain vectors, shared
-    # across joints. kd includes the wheel velocity gain, so this also mis-scales the wheels.
+    # controller-gain mismatch: +/-30% per joint, independently. kp skips the wheels (their
+    # kp is 0, so scaling it would be a dead column): kp_0.._5 are abad/hip/knee L, then R.
+    # kd covers all 8 and includes the wheel velocity gain (kd_3, kd_7).
     kp:
       target: config
       field: kp
+      select: [0, 1, 2, 4, 5, 6]
       mode: scale
       range: [0.70, 1.30]
+      per_element: true
     kd:
       target: config
       field: kd
       mode: scale
       range: [0.70, 1.30]
+      per_element: true

@@ -191,8 +191,21 @@ def resolve_specs(
                     f"in config_arrays {sorted(config_arrays)}"
                 )
             n_field = np.asarray(config_arrays[spec.field]).shape[0]
-            spec.indices = np.arange(n_field, dtype=np.int64)
-            spec.elem_shape = (n_field,)
+            if isinstance(spec.select, str) and spec.select == "all":
+                spec.indices = np.arange(n_field, dtype=np.int64)
+            elif isinstance(spec.select, str) or any(isinstance(s, str) for s in spec.select):
+                raise ValueError(
+                    f"param '{spec.name}': target='config' supports select='all' or integer "
+                    f"indices into '{spec.field}', got {spec.select!r}"
+                )
+            else:
+                spec.indices = np.array(spec.select, dtype=np.int64)
+                if spec.indices.min() < 0 or spec.indices.max() >= n_field:
+                    raise ValueError(
+                        f"param '{spec.name}': select {spec.select!r} out of range for "
+                        f"'{spec.field}' of length {n_field}"
+                    )
+            spec.elem_shape = (len(spec.indices),)
         spec.n_draws = int(np.prod(spec.elem_shape)) if spec.per_element else 1
         specs.append(spec)
     return specs
@@ -270,18 +283,8 @@ def apply_theta(
                 cur_inertia = sys_updates.get("body_inertia", nominal_sys.body_inertia)
                 sys_updates["body_inertia"] = cur_inertia * ratio[:, None]
         else:  # config: kp/kd are arrays on the env config
-            base = kp if spec.field == "kp" else kd
-            base = jnp.asarray(base)
-            if spec.per_element:
-                d = draw
-            else:
-                d = jnp.broadcast_to(draw[0], base.shape)
-            if spec.mode == "scale":
-                new = base * d
-            elif spec.mode == "add":
-                new = base + d
-            else:
-                new = jnp.broadcast_to(d, base.shape)
+            base = jnp.asarray(kp if spec.field == "kp" else kd)
+            new = _apply_one(base, spec.indices, draw, spec.mode, spec.per_element, None)
             if spec.field == "kp":
                 kp = new
             else:

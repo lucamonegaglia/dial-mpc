@@ -281,9 +281,9 @@ def _binned_delta(x: np.ndarray, y: np.ndarray, n_bins: int = 5, n_boot: int = 2
 
 
 def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float, label: str,
-                        out_path: str, n_paired: int, n_elements: Dict[str, int], x_note: str):
+                        out_path: str, n_paired: int, n_elements: Dict[str, int]):
     """`n_elements[name] > 1` marks a panel whose x is a mean over that many elements; it is
-    labelled in orange with the count in its x label. `x_note` explains what x is."""
+    labelled in orange with the count in its x label."""
     order = sorted(stats, key=lambda k: -np.ptp([b["mean"] for b in stats[k]]))
     n = len(order)
     ncols = min(5, n)
@@ -321,12 +321,12 @@ def _plot_binned_panels(stats: Dict[str, List[Dict[str, float]]], overall: float
         axes[j // ncols][j % ncols].axis("off")
 
     subtitle = textwrap.fill(
-        f"{x_note} Bins: per panel, "
-        f"trials are sorted by the plant's sampled value of x and split into "
-        f"{len(stats[order[0]])} equal-count bins of "
+        f"Bins: per panel, "
+        f"trials are sorted by the plant's sampled value of that parameter (mean over elements for "
+        f"per-element parameters) and split into {len(stats[order[0]])} equal-count bins of "
         f"~{int(stats[order[0]][0]['n'])} trials; shaded bands show each bin's value "
         f"range. Points: y: mean Δ in the bin, x: bin's median value. Vertical lines: bootstrap 95% "
-        f"CI. Dashed line: mean Δ over all trials ({overall:.1f}). "
+        f"CI. Dashed line: mean Δ over all trials ({overall:.1f})."
         f"Panels ranked by spread (max − min of the bin means). "
         f"Same plant and MPC seed in both arms; only the planner's model differs.",
         width=int(26 * ncols))
@@ -370,21 +370,14 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_dir: st
                       for d in paired])
     overall = float(np.nanmean(delta))
     views = {
-        "aggregated": (
-            groups, {name: len(cols) for name, cols in groups.items()},
-            "x: the parameter's sampled value; orange names are per-element parameters, "
-            "x = mean over their N independently drawn elements (N in the axis label)."),
-        "per_element": (
-            {c: [c] for c in cols_ok}, {},
-            "x: one sampled column each; `<name>_<i>` is element i of a per-element parameter "
-            "(actuated joints: abad/hip/knee/wheel L, then R), `<name>_<i>_<j>` is component j "
-            "of element i (com_offset_0_j: x/y/z). Constant columns are omitted."),
+        "aggregated": (groups, {name: len(cols) for name, cols in groups.items()}),
+        "per_element": ({c: [c] for c in cols_ok}, {}),
     }
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["view", "parameter", "bin", "x_lo", "x_hi", "x_median", "n_trials",
                     "mean_delta", "ci_lo", "ci_hi"])
-        for view, (col_groups, n_elements, x_note) in views.items():
+        for view, (col_groups, n_elements) in views.items():
             stats = {}
             for name, cols in col_groups.items():
                 x = np.array([_group_value(d[GROUP_NOMINAL_PLANNER], cols) for d in paired])
@@ -395,7 +388,7 @@ def fig_sensitivity_summary(rows: List[Dict], theta_cols: List[str], out_dir: st
                 continue
             _plot_binned_panels(stats, overall, label,
                                 os.path.join(out_dir, f"sensitivity_summary_{view}.png"),
-                                len(paired), n_elements, x_note)
+                                len(paired), n_elements)
             for name, bins in stats.items():
                 for i, b in enumerate(bins):
                     w.writerow([view, name, i, f"{b['x_lo']:.6g}", f"{b['x_hi']:.6g}",
